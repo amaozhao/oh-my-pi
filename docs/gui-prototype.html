@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ACP Workbench - GUI Prototype</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg-0: #0D0D0D;  --bg-1: #1C1C1C;  --bg-2: #262626;  --bg-3: #303030;
+  --border: #3A3A3A;  --text-0: #F0F0F0;  --text-1: #A0A0A0;  --text-2: #686868;
+  --accent: #3B82F6;  --accent-hover: #2563EB;  --accent-light: rgba(59,130,246,0.12);
+  --success: #22C55E;  --success-bg: rgba(34,197,94,0.12);
+  --warning: #F59E0B;  --warning-bg: rgba(245,158,11,0.12);
+  --error: #EF4444;  --error-bg: rgba(239,68,68,0.12);
+  --critical: #DC2626;  --critical-bg: rgba(220,38,38,0.18);
+  --sidebar-w: 68px;  --sidebar-expanded: 240px;  --right-panel-w: 340px;
+  --title-h: 48px;  --status-h: 28px;  --terminal-h: 200px;
+  --radius: 8px;  --radius-sm: 4px;
+}
+
+/* ── Light Theme ── */
+html.light {
+  --bg-0: #F5F5F5;    --bg-1: #FFFFFF;    --bg-2: #F0F0F0;    --bg-3: #E8E8E8;
+  --border: #D4D4D4;   --text-0: #1A1A1A;  --text-1: #555555;  --text-2: #999999;
+  --accent-light: rgba(59,130,246,0.10);
+  --success: #16A34A;  --success-bg: rgba(22,163,74,0.10);
+  --warning: #D97706;  --warning-bg: rgba(217,119,6,0.10);
+  --error: #DC2626;    --error-bg: rgba(220,38,38,0.10);
+  --critical: #B91C1C; --critical-bg: rgba(185,28,28,0.15);
+}
+html.light .runtime-badge { box-shadow: 0 0 0 1px var(--border); }
+html.light .tool-card .body pre,
+html.light #right-panel .panel-content .diff-view { background: #FAFAFA; }
+html.light #sidebar .activity:hover { background: rgba(0,0,0,0.04); }
+html.light .permission-dialog .perm-detail code { background: var(--bg-3); }
+html.light #terminal-wrapper .term-input-line .input::placeholder { color: var(--text-2); }
+html, body { height: 100%; overflow: hidden; background: var(--bg-0); color: var(--text-0); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; font-size: 13px; line-height: 1.5; }
+
+/* ── Title Bar ── */
+#titlebar {
+  height: var(--title-h); background: var(--bg-0); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; padding: 0 16px; gap: 12px; user-select: none; -webkit-app-region: drag;
+}
+#titlebar .workspace { color: var(--text-1); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+#titlebar .workspace .branch { color: var(--accent); background: var(--accent-light); padding: 1px 8px; border-radius: 4px; font-size: 11px; }
+#titlebar .spacer { flex: 1; }
+#titlebar .runtime-badge {
+  display: flex; align-items: center; gap: 6px; padding: 4px 12px;
+  background: var(--success-bg); color: var(--success); border-radius: 12px; font-size: 11px; -webkit-app-region: no-drag;
+}
+#titlebar .runtime-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); }
+#titlebar .session-info { color: var(--text-1); font-size: 11px; display: flex; gap: 6px; -webkit-app-region: no-drag; }
+#titlebar .session-info span { opacity: 0.5; }
+
+/* ── Layout ── */
+#app { display: flex; height: calc(100vh - var(--title-h) - var(--status-h)); }
+
+/* ── Sidebar ── */
+#sidebar {
+  width: var(--sidebar-w); background: var(--bg-0); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; align-items: center; padding: 8px 0; gap: 4px;
+  transition: width 0.15s; overflow: hidden; cursor: default; flex-shrink: 0;
+}
+#sidebar .activity {
+  width: 100%; padding: 8px 10px; display: flex; align-items: center; gap: 10px;
+  color: var(--text-2); cursor: pointer; border-radius: 0; border: none; background: none;
+  font-size: 13px; white-space: nowrap; transition: color 0.1s, background 0.1s; flex-shrink: 0;
+}
+#sidebar .activity:hover { color: var(--text-0); background: rgba(255,255,255,0.04); }
+#sidebar .active { color: var(--accent); background: var(--accent-light); }
+#sidebar .active:hover { background: var(--accent-light); }
+#sidebar .spacer { flex: 1; }
+#sidebar .icon { font-size: 18px; flex-shrink: 0; width: 24px; text-align: center; }
+#sidebar .label { opacity: 0; width: 0; overflow: hidden; transition: opacity 0.15s, width 0.15s; text-align: left; }
+#sidebar.expanded { width: var(--sidebar-expanded); }
+#sidebar.expanded .label { opacity: 1; width: auto; }
+
+/* ── Main Area ── */
+#main { flex: 1; background: var(--bg-1); display: flex; flex-direction: column; min-width: 0; }
+#transcript-header {
+  padding: 12px 20px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+}
+#transcript-header h2 { font-size: 14px; font-weight: 600; }
+#transcript-header .tabs { display: flex; gap: 4px; margin-left: 16px; }
+#transcript-header .tabs .tab {
+  padding: 4px 12px; border-radius: 6px; cursor: pointer; color: var(--text-1);
+  font-size: 12px; border: 1px solid transparent; background: none;
+}
+#transcript-header .tabs .tab.active { color: var(--text-0); background: var(--bg-3); border-color: var(--border); }
+#transcript-header .tabs .tab:hover { color: var(--text-0); }
+#transcript-header .spacer { flex: 1; }
+#transcript-header .btn {
+  padding: 5px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-2);
+  color: var(--text-0); cursor: pointer; font-size: 12px;
+}
+#transcript-header .btn:hover { background: var(--bg-3); }
+#transcript-header .btn.primary { background: var(--accent); border-color: var(--accent); color: white; }
+#transcript-header .btn.primary:hover { background: var(--accent-hover); }
+
+/* Transcript */
+#transcript {
+  flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 16px;
+}
+#transcript::-webkit-scrollbar { width: 6px; }
+#transcript::-webkit-scrollbar-track { background: transparent; }
+#transcript::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* Message bubbles */
+.msg { display: flex; gap: 12px; max-width: 85%; }
+.msg.user { align-self: flex-end; flex-direction: row-reverse; }
+.msg.agent { align-self: flex-start; }
+.msg .avatar {
+  width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center;
+  font-size: 14px; flex-shrink: 0;
+}
+.msg.user .avatar { background: var(--accent); color: white; }
+.msg.agent .avatar { background: var(--bg-3); color: var(--text-1); border: 1px solid var(--border); }
+.msg .bubble { padding: 10px 16px; border-radius: 12px; font-size: 13px; line-height: 1.6; }
+.msg.user .bubble { background: var(--accent-light); color: var(--text-0); border-bottom-right-radius: 4px; }
+.msg.agent .bubble { background: var(--bg-2); border: 1px solid var(--border); border-bottom-left-radius: 4px; color: var(--text-0); }
+
+/* Tool cards */
+.tool-card {
+  border: 1px solid var(--border); background: var(--bg-2); border-radius: var(--radius); overflow: hidden;
+}
+.tool-card .header {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  border-bottom: 1px solid var(--border); cursor: pointer; user-select: none;
+}
+.tool-card .header .chevron { color: var(--text-2); font-size: 10px; transition: transform 0.15s; }
+.tool-card .header .chevron.open { transform: rotate(90deg); }
+.tool-card .header .kind-badge {
+  font-size: 10px; padding: 2px 8px; border-radius: 4px; font-weight: 600;
+}
+.tool-card .header .kind-badge.read { background: var(--success-bg); color: var(--success); }
+.tool-card .header .kind-badge.write { background: var(--warning-bg); color: var(--warning); }
+.tool-card .header .kind-badge.exec { background: var(--error-bg); color: var(--error); }
+.tool-card .header .kind-badge.critical { background: var(--critical-bg); color: var(--critical); }
+.tool-card .header .tool-name { color: var(--text-0); font-weight: 500; font-size: 12px; }
+.tool-card .header .tool-status { margin-left: auto; font-size: 11px; }
+.tool-card .header .tool-status.success { color: var(--success); }
+.tool-card .header .tool-status.pending { color: var(--warning); }
+.tool-card .header .tool-status.error { color: var(--error); }
+.tool-card .body { padding: 12px; font-size: 12px; }
+.tool-card .body pre {
+  background: var(--bg-0); padding: 10px; border-radius: var(--radius-sm); overflow-x: auto;
+  font-family: "JetBrains Mono", "Iosevka", "Cascadia Code", monospace; font-size: 12px; color: var(--text-1); line-height: 1.5;
+}
+.tool-card .body .file-path { color: var(--accent); font-family: "JetBrains Mono", monospace; font-size: 11px; margin-bottom: 6px; }
+.tool-card .body .locations { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.tool-card .body .locations .loc { color: var(--accent); cursor: pointer; padding: 2px 6px; border-radius: 4px; font-family: "JetBrains Mono", monospace; font-size: 11px; }
+.tool-card .body .locations .loc:hover { background: var(--accent-light); }
+.tool-card .body img.screenshot { max-width: 100%; border-radius: var(--radius-sm); margin-top: 8px; }
+.collapsed { display: none; }
+
+/* Permission dialog */
+.permission-dialog {
+  border: 1px solid var(--warning); background: var(--warning-bg); border-radius: var(--radius); padding: 16px;
+}
+.permission-dialog.danger { border-color: var(--error); background: var(--error-bg); }
+.permission-dialog .perm-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.permission-dialog .perm-header .badge {
+  font-size: 10px; padding: 2px 8px; border-radius: 4px; font-weight: 600;
+}
+.permission-dialog .perm-header .badge.exec { background: var(--error-bg); color: var(--error); }
+.permission-dialog .perm-header .badge.write { background: var(--warning-bg); color: var(--warning); }
+.permission-dialog .perm-detail { font-size: 12px; color: var(--text-1); margin-bottom: 12px; }
+.permission-dialog .perm-detail code { color: var(--text-0); background: var(--bg-0); padding: 1px 6px; border-radius: 3px; font-family: "JetBrains Mono", monospace; }
+.permission-dialog .perm-actions { display: flex; gap: 8px; }
+.permission-dialog .perm-actions .btn {
+  padding: 5px 16px; border-radius: 6px; border: 1px solid var(--border); cursor: pointer;
+  font-size: 12px; font-weight: 500; transition: background 0.1s;
+}
+.permission-dialog .perm-actions .btn.approve { background: var(--warning); border-color: var(--warning); color: #000; }
+.permission-dialog .perm-actions .btn.approve:hover { background: #D97706; }
+.permission-dialog.danger .perm-actions .btn.approve { background: var(--error); border-color: var(--error); color: white; }
+.permission-dialog.danger .perm-actions .btn.approve:hover { background: #B91C1C; }
+.permission-dialog .perm-actions .btn.deny { background: transparent; color: var(--text-0); }
+.permission-dialog .perm-actions .btn.deny:hover { background: var(--bg-3); }
+.permission-dialog .perm-actions .btn.always { background: transparent; color: var(--text-1); border-color: transparent; font-size: 11px; }
+.permission-dialog .perm-actions .btn.always:hover { color: var(--text-0); }
+
+/* Elicitation */
+.elicitation-card {
+  border: 1px solid var(--border); background: var(--bg-2); border-radius: var(--radius); padding: 16px;
+}
+.elicitation-card .question { font-size: 13px; margin-bottom: 12px; }
+.elicitation-card .options { display: flex; flex-direction: column; gap: 6px; }
+.elicitation-card .options .opt {
+  padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+  display: flex; align-items: center; gap: 10px; background: var(--bg-3); transition: border-color 0.1s;
+}
+.elicitation-card .options .opt:hover { border-color: var(--accent); }
+.elicitation-card .options .opt .radio { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--text-2); flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+.elicitation-card .options .opt .radio.checked { border-color: var(--accent); }
+.elicitation-card .options .opt .radio.checked::after { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.elicitation-card .options .opt .opt-label { font-size: 13px; }
+.elicitation-card .options .opt .opt-desc { font-size: 11px; color: var(--text-1); }
+
+/* Prompt input */
+#prompt-area {
+  padding: 12px 20px 16px; border-top: 1px solid var(--border); flex-shrink: 0; background: var(--bg-1);
+}
+#prompt-area .input-row { display: flex; gap: 8px; align-items: flex-end; }
+#prompt-area textarea {
+  flex: 1; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--text-0); padding: 10px 14px; font-size: 13px; font-family: inherit;
+  resize: none; outline: none; min-height: 42px; max-height: 120px; transition: border-color 0.1s;
+}
+#prompt-area textarea:focus { border-color: var(--accent); }
+#prompt-area textarea::placeholder { color: var(--text-2); }
+#prompt-area .send-btn {
+  width: 42px; height: 42px; border-radius: var(--radius); background: var(--accent);
+  border: none; color: white; font-size: 18px; cursor: pointer; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center; transition: background 0.1s;
+}
+#prompt-area .send-btn:hover { background: var(--accent-hover); }
+
+/* ── Right Panel ── */
+#right-panel {
+  width: 0; overflow: hidden; background: var(--bg-2); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; transition: width 0.2s; flex-shrink: 0;
+}
+#right-panel.open { width: var(--right-panel-w); }
+#right-panel .panel-header {
+  padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+}
+#right-panel .panel-header h3 { font-size: 13px; font-weight: 600; }
+#right-panel .panel-header .close-btn { margin-left: auto; background: none; border: none; color: var(--text-2); cursor: pointer; font-size: 16px; padding: 2px; }
+#right-panel .panel-header .close-btn:hover { color: var(--text-0); }
+#right-panel .panel-content { flex: 1; overflow-y: auto; padding: 16px; font-size: 12px; }
+#right-panel .panel-content h4 { font-size: 12px; font-weight: 600; color: var(--text-1); margin-bottom: 8px; }
+#right-panel .panel-content .detail-row { display: flex; justify-content: space-between; padding: 4px 0; color: var(--text-1); }
+#right-panel .panel-content .detail-row .val { color: var(--text-0); }
+#right-panel .panel-content .section { margin-bottom: 16px; }
+#right-panel .panel-content .diff-view { background: var(--bg-0); border-radius: var(--radius-sm); padding: 10px; font-family: "JetBrains Mono", monospace; font-size: 11px; line-height: 1.6; overflow-x: auto; }
+#right-panel .panel-content .diff-view .add { color: var(--success); }
+#right-panel .panel-content .diff-view .del { color: var(--error); }
+#right-panel::-webkit-scrollbar { width: 4px; }
+#right-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* ── Terminal Panel ── */
+#terminal-wrapper {
+  height: 0; overflow: hidden; background: var(--bg-1); border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; transition: height 0.2s; flex-shrink: 0;
+}
+#terminal-wrapper.open { height: var(--terminal-h); }
+#terminal-wrapper .term-header {
+  padding: 6px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 4px; flex-shrink: 0;
+}
+#terminal-wrapper .term-header .tab {
+  padding: 3px 12px; font-size: 11px; border-radius: 4px; cursor: pointer; color: var(--text-1); background: none; border: none;
+}
+#terminal-wrapper .term-header .tab.active { background: var(--bg-2); color: var(--text-0); }
+#terminal-wrapper .term-header .tab:hover { color: var(--text-0); }
+#terminal-wrapper .term-header .close-term { margin-left: auto; background: none; border: none; color: var(--text-2); cursor: pointer; font-size: 14px; }
+#terminal-wrapper .term-header .close-term:hover { color: var(--text-0); }
+#terminal-wrapper .term-body {
+  flex: 1; padding: 8px 16px; overflow-y: auto; font-family: "JetBrains Mono", "Iosevka", monospace;
+  font-size: 13px; line-height: 1.6; color: var(--text-0);
+}
+#terminal-wrapper .term-body .line .prompt { color: var(--success); }
+#terminal-wrapper .term-body .line .cmd { color: var(--text-0); }
+#terminal-wrapper .term-body .line .out { color: var(--text-1); }
+#terminal-wrapper .term-body .line .out.ok { color: var(--success); }
+#terminal-wrapper .term-body .line .out.err { color: var(--error); }
+#terminal-wrapper .term-body::-webkit-scrollbar { width: 4px; }
+#terminal-wrapper .term-body::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+#terminal-wrapper .term-input-line {
+  padding: 4px 16px 8px; display: flex; align-items: center; gap: 4px;
+  font-family: "JetBrains Mono", monospace; font-size: 13px;
+}
+#terminal-wrapper .term-input-line .prompt { color: var(--success); }
+#terminal-wrapper .term-input-line .input { flex: 1; background: none; border: none; color: var(--text-0); outline: none; font-family: inherit; font-size: 13px; }
+
+/* ── Status Bar ── */
+#statusbar {
+  height: var(--status-h); background: var(--bg-0); border-top: 1px solid var(--border);
+  display: flex; align-items: center; padding: 0 16px; gap: 16px; font-size: 11px; color: var(--text-2);
+}
+#statusbar .item { display: flex; align-items: center; gap: 4px; }
+#statusbar .item .dot { width: 5px; height: 5px; border-radius: 50%; }
+#statusbar .item .dot.ok { background: var(--success); }
+#statusbar .item .dot.busy { background: var(--warning); animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+#statusbar .spacer { flex: 1; }
+
+/* ── Responsive ── */
+@media (max-width: 800px) {
+  #right-panel.open { width: 100%; position: absolute; right: 0; top: 0; bottom: 0; z-index: 10; }
+  #app { position: relative; }
+}
+</style>
+</head>
+<body>
+
+<!-- Title Bar -->
+<div id="titlebar">
+  <div class="workspace">
+    <span>📁</span>
+    <span>~/workspace/oh-my-pi</span>
+    <span class="branch">feature/desktop</span>
+  </div>
+  <div class="spacer"></div>
+  <div class="runtime-badge"><span class="dot"></span> ACP · running</div>
+  <div class="session-info">
+    <span>session: main</span><span>|</span><span>model: claude-4-opus</span><span>|</span><span>tokens: 2.4k / 200k</span>
+  </div>
+</div>
+
+<div id="app">
+
+  <!-- Sidebar -->
+  <div id="sidebar">
+    <button class="activity active" data-view="workbench"><span class="icon">💬</span><span class="label">Workbench</span></button>
+    <button class="activity" data-view="tasks"><span class="icon">📋</span><span class="label">Tasks</span></button>
+    <button class="activity" data-view="debug"><span class="icon">🐞</span><span class="label">Debug</span></button>
+    <button class="activity" data-view="browser"><span class="icon">🌐</span><span class="label">Browser</span></button>
+    <div class="spacer"></div>
+    <button class="activity" data-view="toolbox"><span class="icon">🧰</span><span class="label">Toolbox</span></button>
+  </div>
+
+  <!-- Main Area -->
+  <div id="main">
+    <div id="transcript-header">
+      <h2>Transcript</h2>
+      <div class="tabs">
+        <span class="tab active">main</span>
+        <span class="tab">session-2</span>
+        <span class="tab">session-3</span>
+      </div>
+      <div class="spacer"></div>
+      <button class="btn primary" onclick="toggleTerminal()">⌨ Terminal</button>
+      <button class="btn" onclick="toggleRightPanel()">ℹ Details</button>
+    </div>
+
+    <div id="transcript">
+
+      <!-- Agent greeting -->
+      <div class="msg agent">
+        <div class="avatar">🤖</div>
+        <div class="bubble">我在 <code>feature/desktop</code> 分支上。有什么需要帮忙的？</div>
+      </div>
+
+      <!-- User message -->
+      <div class="msg user">
+        <div class="avatar">U</div>
+        <div class="bubble">帮我在 packages/desktop-app 下搜索所有使用 "ipcMain" 的地方</div>
+      </div>
+
+      <!-- Tool event: search -->
+      <div class="tool-card">
+        <div class="header">
+          <span class="chevron open">▶</span>
+          <span class="kind-badge read">read</span>
+          <span class="tool-name">search</span>
+          <span class="tool-status success">✓ 完成 (0.32s)</span>
+        </div>
+        <div class="body">
+          <div class="file-path">packages/desktop-app/**/*.ts — pattern: ipcMain</div>
+          <pre>packages/desktop-app/src/main/ipc.ts
+  12:  ipcMain.handle('startRuntime', handleStartRuntime)
+  45:  ipcMain.handle('createSession', handleCreateSession)
+  78:  ipcMain.handle('sendPrompt', handleSendPrompt)
+  102: ipcMain.handle('respondPermission', handleRespondPermission)
+
+packages/desktop-app/src/main/ipc-handlers.ts
+  1:   import { ipcMain } from 'electron'
+  34:  ipcMain.handle('runCommand', handleRunCommand)
+  67:  ipcMain.handle('respondElicitation', handleRespondElicitation)</pre>
+          <div class="locations">
+            <span class="loc">📄 packages/desktop-app/src/main/ipc.ts → 12</span>
+            <span class="loc">📄 packages/desktop-app/src/main/ipc-handlers.ts → 1</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Agent response -->
+      <div class="msg agent">
+        <div class="avatar">🤖</div>
+        <div class="bubble">
+          找到了 2 个文件共 6 处 <code>ipcMain</code> 调用。主要在 <code>ipc.ts</code> 和 <code>ipc-handlers.ts</code> 中。
+          需要我查看具体某个 handler 的实现吗？
+        </div>
+      </div>
+
+      <!-- User message -->
+      <div class="msg user">
+        <div class="avatar">U</div>
+        <div class="bubble">查看 handleStartRuntime 的实现，然后增加超时处理，超过 10 秒就拒绝</div>
+      </div>
+
+      <!-- Tool event: lsp definition -->
+      <div class="tool-card">
+        <div class="header">
+          <span class="chevron open">▶</span>
+          <span class="kind-badge read">read</span>
+          <span class="tool-name">lsp · definition</span>
+          <span class="tool-status success">✓ 完成 (0.18s)</span>
+        </div>
+        <div class="body">
+          <div class="file-path">packages/desktop-app/src/main/ipc.ts :12</div>
+          <pre>12: ipcMain.handle('startRuntime', handleStartRuntime)</pre>
+        </div>
+      </div>
+
+      <!-- Tool event: read -->
+      <div class="tool-card">
+        <div class="header">
+          <span class="chevron open">▶</span>
+          <span class="kind-badge read">read</span>
+          <span class="tool-name">read</span>
+          <span class="tool-status success">✓ 完成 (0.05s)</span>
+        </div>
+        <div class="body">
+          <div class="file-path">packages/desktop-app/src/main/ipc.ts</div>
+          <pre>import { ipcMain } from 'electron'
+
+export function handleStartRuntime(_event, config) {
+  const proc = spawn('omp', ['acp', ...config.args])
+  // 当前无超时处理
+  return proc
+}</pre>
+        </div>
+      </div>
+
+      <!-- Permission dialog (write tier) -->
+      <div class="permission-dialog">
+        <div class="perm-header">
+          <span class="badge write">write</span>
+          <span style="font-size:13px;font-weight:500;">edit · packages/desktop-app/src/main/ipc.ts</span>
+        </div>
+        <div class="perm-detail">
+          增加 <code>handleStartRuntime</code> 超时处理：超过 10 秒自动 reject
+        </div>
+        <pre style="background:var(--bg-0);padding:10px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:12px;margin-bottom:12px;overflow-x:auto;">
+<span style="color:var(--success);">+ import { setTimeout } from 'timers/promises'</span>
+<span style="color:var(--success);">+ const RUNTIME_TIMEOUT = 10_000</span>
+  export function handleStartRuntime(_event, config) {
+<span style="color:var(--success);">+   const acp = Promise.race([</span>
+<span style="color:var(--success);">+     startAcpProcess(config),</span>
+<span style="color:var(--success);">+     setTimeout(RUNTIME_TIMEOUT).then(() => { throw new Error('ACP startup timeout') })</span>
+<span style="color:var(--success);">+   ])</span>
+    const proc = spawn('omp', ['acp', ...config.args])
+    return proc
+  }</pre>
+        <div class="perm-actions">
+          <button class="btn approve">Approve</button>
+          <button class="btn deny">Deny</button>
+          <button class="btn always">Always allow in this scope</button>
+        </div>
+      </div>
+
+      <!-- Elicitation -->
+      <div class="elicitation-card">
+        <div class="question">🤖 是否要将超时时间设为可配置参数？</div>
+        <div class="options">
+          <div class="opt" onclick="selectElicit(this)">
+            <div class="radio"></div>
+            <div>
+              <div class="opt-label">是，从 settings 读取</div>
+              <div class="opt-desc">允许用户在 settings 面板中自定义超时值</div>
+            </div>
+          </div>
+          <div class="opt" onclick="selectElicit(this)">
+            <div class="radio"></div>
+            <div>
+              <div class="opt-label">否，硬编码 10 秒即可</div>
+              <div class="opt-desc">当前不需要暴露给用户配置</div>
+            </div>
+          </div>
+          <div class="opt" onclick="selectElicit(this)">
+            <div class="radio"></div>
+            <div>
+              <div class="opt-label">其他方案</div>
+              <div class="opt-desc">输入自定义方案</div>
+            </div>
+          </div>
+        </div>
+        <div style="gap:8px;margin-top:12px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-3);display:none" id="elicit-custom">
+          <input type="text" placeholder="输入自定义方案..." style="flex:1;background:none;border:none;color:var(--text-0);outline:none;font-size:13px;">
+        </div>
+        <div style="margin-top:12px;display:flex;gap:8px;">
+          <button class="btn primary" style="padding:6px 20px;border-radius:6px;background:var(--accent);border:none;color:white;cursor:pointer;font-size:12px;">Submit</button>
+          <button class="btn" style="padding:6px 20px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-0);cursor:pointer;font-size:12px;">Skip</button>
+        </div>
+      </div>
+
+      <!-- Tool event: edit (completed) -->
+      <div class="tool-card">
+        <div class="header">
+          <span class="chevron open">▶</span>
+          <span class="kind-badge write">write</span>
+          <span class="tool-name">edit</span>
+          <span class="tool-status success">✓ Applied (0.22s)</span>
+        </div>
+        <div class="body">
+          <div class="file-path">packages/desktop-app/src/main/ipc.ts :12-20</div>
+          <pre style="color:var(--text-1);">
+<span style="color:var(--text-2);">// Added timeout handling via Promise.race</span>
+<span style="color:var(--success);">+ import { setTimeout } from 'timers/promises'</span>
+<span style="color:var(--success);">+ const RUNTIME_TIMEOUT = 10_000</span>
+  export function handleStartRuntime(_event, config) {
+<span style="color:var(--success);">+   const controller = new AbortController()</span>
+<span style="color:var(--success);">+   const timeout = setTimeout(RUNTIME_TIMEOUT, null, { signal: controller.signal })</span>
+<span style="color:var(--success);">+     .then(() => { throw new Error('ACP startup timed out') })</span>
+    const proc = spawn('omp', ['acp', ...config.args])
+<span style="color:var(--success);">+   return Promise.race([proc, timeout])</span>
+  }</pre>
+          <div class="locations">
+            <span class="loc">📄 packages/desktop-app/src/main/ipc.ts (3 insertions)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Prompt Input -->
+    <div id="prompt-area">
+      <div class="input-row">
+        <textarea placeholder="输入消息… （/ 查看命令，Ctrl+K 打开命令面板）" rows="1"></textarea>
+        <button class="send-btn">➤</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right Panel -->
+  <div id="right-panel">
+    <div class="panel-header">
+      <h3>Tool Details</h3>
+      <button class="close-btn" onclick="toggleRightPanel()">✕</button>
+    </div>
+    <div class="panel-content">
+      <div class="section">
+        <h4>Request</h4>
+        <div class="detail-row"><span>Tool</span><span class="val">edit</span></div>
+        <div class="detail-row"><span>File</span><span class="val">packages/desktop-app/src/main/ipc.ts</span></div>
+        <div class="detail-row"><span>Range</span><span class="val">lines 12-20</span></div>
+        <div class="detail-row"><span>Approval</span><span class="val" style="color:var(--warning);">write</span></div>
+        <div class="detail-row"><span>Status</span><span class="val" style="color:var(--success);">applied</span></div>
+      </div>
+      <div class="section">
+        <h4>Diff Preview</h4>
+        <div class="diff-view">
+          <div class="add">+ import { setTimeout } from 'timers/promises'</div>
+          <div class="add">+ const RUNTIME_TIMEOUT = 10_000</div>
+          <span class="del">- // 当前无超时处理</span>
+        </div>
+      </div>
+      <div class="section">
+        <h4>Session Info</h4>
+        <div class="detail-row"><span>Session</span><span class="val">main</span></div>
+        <div class="detail-row"><span>Model</span><span class="val">claude-4-opus</span></div>
+        <div class="detail-row"><span>Tokens</span><span class="val">2,847 / 200,000</span></div>
+        <div class="detail-row"><span>Runtime</span><span class="val">omp acp · PID 28471</span></div>
+        <div class="detail-row"><span>Uptime</span><span class="val">12m 34s</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Terminal Panel -->
+<div id="terminal-wrapper">
+  <div class="term-header">
+    <button class="tab active">bash</button>
+    <button class="tab">eval-py</button>
+    <button class="tab">eval-js</button>
+    <button class="close-term" onclick="toggleTerminal()">✕</button>
+  </div>
+  <div class="term-body">
+    <div class="line"><span class="prompt">$ </span><span class="cmd">cd /workspace/oh-my-pi</span></div>
+    <div class="line"><span class="prompt">$ </span><span class="cmd">bun run test packages/desktop-app</span></div>
+    <div class="line"><span class="out">bun test v1.2.5</span></div>
+    <div class="line"><span class="out ok">  ✓ ipc-handler.test.ts (12 tests) 1.2s</span></div>
+    <div class="line"><span class="out ok">  ✓ permission-dialog.test.ts (8 tests) 0.8s</span></div>
+    <div class="line"><span class="out ok">  ✓ session-manager.test.ts (15 tests) 1.5s</span></div>
+    <div class="line"><span class="out ok">  42 passed (3.8s)</span></div>
+  </div>
+  <div class="term-input-line">
+    <span class="prompt">$ </span>
+    <input class="input" placeholder="输入命令..." spellcheck="false">
+  </div>
+</div>
+
+<!-- Status Bar -->
+<div id="statusbar">
+  <div class="item"><span class="dot ok"></span> LSP · 3 servers</div>
+  <div class="item">feature/desktop</div>
+  <div class="spacer"></div>
+  <div class="item" id="theme-toggle" style="cursor:pointer;padding:2px 8px;border-radius:4px;">☀️ Light</div>
+  <div class="item">ACP · running</div>
+  <div class="item">12.4k / 200k tokens</div>
+  <div class="item">claude-4-opus</div>
+</div>
+
+<script>
+function toggleTerminal() { document.getElementById('terminal-wrapper').classList.toggle('open'); }
+function toggleRightPanel() { document.getElementById('right-panel').classList.toggle('open'); }
+
+function selectElicit(el) {
+  const card = el.closest('.elicitation-card');
+  card.querySelectorAll('.opt .radio').forEach(r => r.classList.remove('checked'));
+  el.querySelector('.radio').classList.add('checked');
+  const custom = document.getElementById('elicit-custom');
+  custom.style.display = el.querySelector('.opt-label').textContent === '其他方案' ? 'flex' : 'none';
+}
+
+// Sidebar: click to expand + activate view
+document.querySelectorAll('#sidebar .activity').forEach(btn => {
+  btn.addEventListener('click', function(e) {
+    const sb = document.getElementById('sidebar');
+    if (window.innerWidth > 600 && !sb.classList.contains('expanded')) {
+      sb.classList.add('expanded'); e.stopPropagation();
+    }
+    document.querySelectorAll('#sidebar .activity').forEach(b => b.classList.remove('active'));
+    this.classList.add('active');
+  });
+});
+document.addEventListener('click', function(e) {
+  const sb = document.getElementById('sidebar');
+  if (sb.classList.contains('expanded') && !sb.contains(e.target)) sb.classList.remove('expanded');
+});
+
+// Auto-resize textarea
+document.querySelector('#prompt-area textarea').addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+
+// Terminal Enter to submit
+document.querySelector('#terminal-wrapper .term-input-line .input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && this.value.trim()) {
+    const body = document.querySelector('#terminal-wrapper .term-body');
+    const line = document.createElement('div'); line.className = 'line';
+    line.innerHTML = '<span class="prompt">$ </span><span class="cmd">' + this.value + '</span>';
+    body.appendChild(line); body.scrollTop = body.scrollHeight;
+    this.value = '';
+  }
+});
+
+// Theme toggle
+const themeToggle = document.getElementById('theme-toggle');
+themeToggle.addEventListener('click', () => {
+  const html = document.documentElement;
+  html.classList.toggle('light');
+  themeToggle.textContent = html.classList.contains('light') ? '🌙 Dark' : '☀️ Light';
+});
+
+// Tab switching: terminal
+document.querySelectorAll('#terminal-wrapper .term-header .tab').forEach(tab => {
+  tab.addEventListener('click', function() {
+    document.querySelectorAll('#terminal-wrapper .term-header .tab').forEach(t => t.classList.remove('active'));
+    this.classList.add('active');
+  });
+});
+
+// Tab switching: transcript header
+document.querySelectorAll('#transcript-header .tabs .tab').forEach(tab => {
+  tab.addEventListener('click', function() {
+    document.querySelectorAll('#transcript-header .tabs .tab').forEach(t => t.classList.remove('active'));
+    this.classList.add('active');
+  });
+});
+
+// Tool card: toggle body + chevron
+document.querySelectorAll('.tool-card .header').forEach(h => {
+  h.addEventListener('click', function() {
+    const body = this.nextElementSibling;
+    const ch = this.querySelector('.chevron');
+    if (ch) ch.classList.toggle('open');
+    if (body) body.classList.toggle('collapsed');
+  });
+});
+</script>
+</body>
+</html>
