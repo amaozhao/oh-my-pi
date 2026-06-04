@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Fixed local/self-hosted providers leaking machine-specific endpoints into the bundled `models.json`. A `generate-models` run on a machine with a LiteLLM proxy baked 1202 `litellm` models pinned to `http://localhost:4000/v1` into the committed catalog. `litellm` (and `lm-studio`) now join `ollama`/`vllm` in the generator's discovery-only exclusion set, so local providers are never fetched during generation nor written to `models.json` — they are discovered dynamically at runtime instead. LiteLLM model discovery now enriches metadata against models.dev (the same reference source the other gateway providers use) rather than a bundled reference map. Added a regression test pinning the invariant (no local provider blocks, no loopback/private-network `baseUrl`s in the bundled catalog).
+
+## [15.8.2] - 2026-06-03
+
+### Fixed
+
 - Fixed `opencode-zen/minimax-m3-free` (and forward-compat `opencode-zen/minimax-m3`) and `opencode-go/minimax-m3` being routed to `anthropic-messages` despite the OpenCode Zen/Go gateways only serving these ids at `/v1/chat/completions`, which surfaced raw MiniMax/tool-call markup (`<invoke name="bash">`, `<tool_call>`, `<description>`, `<cwd>`, `<|minimax|>`) in the UI. Resolver overrides now pin these ids to `openai-completions` and the bundled `models.json` entries are flipped to match. ([#1617](https://github.com/can1357/oh-my-pi/issues/1617))
 - Fixed MiniMax Coding Plan China login opening the international `platform.minimax.io` subscription page instead of the China `platform.minimaxi.com` page.
 

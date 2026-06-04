@@ -1074,9 +1074,9 @@ describe("TUI terminal-state regressions", () => {
 			// on software-keyboard height toggles), so a real resize carrying new
 			// content fell through to the diff/append emitter, which scrolls relative
 			// to the pre-resize viewport top — offsetting the appended rows by the
-			// geometry delta. Keyboard toggles (pure height change, no content) are
-			// still no-ops via the unchanged-content path; a content-bearing resize
-			// must repaint at the new geometry.
+			// geometry delta. Pure height changes repaint too: otherwise the terminal
+			// exposes blank rows that a later append can fill without growing
+			// scrollback.
 			await withEnvPatch({ TERMUX_VERSION: "0.118" }, async () => {
 				const term = new VirtualTerminal(120, 12);
 				const tui = new TUI(term);
@@ -1098,6 +1098,41 @@ describe("TUI terminal-state regressions", () => {
 					await settle(term);
 
 					expect(visible(term)).toEqual([...final, ...Array<string>(24 - final.length).fill("")]);
+				} finally {
+					tui.stop();
+				}
+			});
+		});
+
+		it("repaints pure Termux height grows so later appends cannot fill phantom blank rows", async () => {
+			// Stress repro: linux-normal-termux-small seed 0x207adeeb op 1257-1259.
+			// A pure Termux height grow (software keyboard/rotation, no content
+			// change) used to no-op. The terminal exposed two blank rows at the bottom
+			// of the viewport, and the next append wrote into that phantom space
+			// instead of scrolling a new row into native history, breaking row
+			// accounting and hiding the true frame tail.
+			await withEnvPatch({ TERMUX_VERSION: "0.118" }, async () => {
+				const term = new VirtualTerminal(16, 4, 100);
+				const tui = new TUI(term);
+				const lines = rows("row-", 12);
+				const component = new MutableLinesComponent(lines);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					term.resize(16, 6);
+					await settle(term);
+					expect(visible(term)).toEqual(lines.slice(6));
+
+					const final = [...lines, "row-12"];
+					component.setLines(final);
+					tui.requestRender();
+					await settle(term);
+
+					expect(visible(term)).toEqual(final.slice(7));
+					expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual(final);
 				} finally {
 					tui.stop();
 				}
@@ -2337,8 +2372,8 @@ describe("TUI terminal-state regressions", () => {
 		});
 
 		it("paints a viewport-saturating pure-append on native Windows Terminal (no \\x1b[3J)", async () => {
-			// Regression: under `WT_SESSION` on native Windows the kernel32 probe is
-			// suppressed and `isNativeViewportAtBottom()` returns `undefined`. The
+			// Regression: on native Windows the viewport probe is permanently
+			// `undefined` (ProcessTerminal does not implement it — see #1635/#1746). The
 			// `15.7.5` #1635 fix routed pure-append-over-saturated-viewport frames to
 			// `deferredMutation` here, which is a literal no-op. That froze the editor
 			// on the very keystroke that grows `lines.length` past the viewport (the
@@ -3081,11 +3116,28 @@ describe("TUI terminal-state regressions", () => {
 		}
 
 		const UNRESET_BG_ROW = "\x1b[41mRED-BG-NO-RESET";
+		const UNRESET_FG_UNDERLINE_ROW = "\x1b[32;4mGREEN-UNDER-NO-RESET";
 
 		function backgroundRows(term: VirtualTerminal, height: number): number[] {
 			const rows: number[] = [];
 			for (let row = 0; row < height; row++) {
 				if (term.getViewportRowBackgroundColumns(row).length > 0) rows.push(row);
+			}
+			return rows;
+		}
+
+		function foregroundRows(term: VirtualTerminal, height: number): number[] {
+			const rows: number[] = [];
+			for (let row = 0; row < height; row++) {
+				if (term.getViewportRowForegroundColumns(row).length > 0) rows.push(row);
+			}
+			return rows;
+		}
+
+		function underlineRows(term: VirtualTerminal, height: number): number[] {
+			const rows: number[] = [];
+			for (let row = 0; row < height; row++) {
+				if (term.getViewportRowUnderlineColumns(row).length > 0) rows.push(row);
 			}
 			return rows;
 		}
@@ -3118,6 +3170,41 @@ describe("TUI terminal-state regressions", () => {
 				await settle(term);
 				expect(backgroundRows(term, height)).toEqual([1]);
 				expect(visible(term)[2]).toBe("");
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("confines unreset foreground and underline to their own row", async () => {
+			const height = 6;
+			const term = new VirtualTerminal(24, height);
+			const tui = new TUI(term);
+			const component = new RawLinesComponent(["plain-0", UNRESET_FG_UNDERLINE_ROW, "plain-2"]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(foregroundRows(term, height)).toEqual([1]);
+				expect(underlineRows(term, height)).toEqual([1]);
+
+				// Rewriting the next row starts with an erase; leaked SGR would make
+				// the edited row green/underlined despite containing plain text.
+				component.setLines(["plain-0", UNRESET_FG_UNDERLINE_ROW, "EDITED-2"]);
+				tui.requestRender();
+				await settle(term);
+				expect(foregroundRows(term, height)).toEqual([1]);
+				expect(underlineRows(term, height)).toEqual([1]);
+				expect(term.getViewportRowForegroundColumns(2)).toEqual([]);
+				expect(term.getViewportRowUnderlineColumns(2)).toEqual([]);
+
+				component.setLines(["plain-0", UNRESET_FG_UNDERLINE_ROW]);
+				tui.requestRender();
+				await settle(term);
+				expect(foregroundRows(term, height)).toEqual([1]);
+				expect(underlineRows(term, height)).toEqual([1]);
+				expect(term.getViewportRowForegroundColumns(2)).toEqual([]);
+				expect(term.getViewportRowUnderlineColumns(2)).toEqual([]);
 			} finally {
 				tui.stop();
 			}
@@ -3240,6 +3327,20 @@ describe("TUI terminal-state regressions", () => {
 			}
 		}
 
+		class CursorVisibilityTerminal extends VirtualTerminal {
+			visibilityWrites: string[] = [];
+
+			override hideCursor(): void {
+				this.visibilityWrites.push("\x1b[?25l");
+				super.hideCursor();
+			}
+
+			override showCursor(): void {
+				this.visibilityWrites.push(SHOW_CURSOR);
+				super.showCursor();
+			}
+		}
+
 		afterEach(() => {
 			vi.restoreAllMocks();
 		});
@@ -3286,6 +3387,25 @@ describe("TUI terminal-state regressions", () => {
 					vi.restoreAllMocks();
 				}
 			}
+		});
+
+		it("shows the terminal cursor during stop even when paints keep it hidden", async () => {
+			// DECSC/DECRC restore cursor position and attributes, not DECTCEM
+			// visibility. The TUI hides the hardware cursor before paints, so stop()
+			// must explicitly show it even when the session disabled hardware-cursor
+			// rendering and no paint ever emitted \x1b[?25h.
+			const term = new CursorVisibilityTerminal(20, 4);
+			const tui = new TUI(term, false);
+			tui.addChild(new MutableLinesComponent(["prompt"]));
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(term.visibilityWrites).not.toContain(SHOW_CURSOR);
+			} finally {
+				tui.stop();
+			}
+			expect(term.visibilityWrites.at(-1)).toBe(SHOW_CURSOR);
 		});
 	});
 
@@ -3471,5 +3591,127 @@ describe("TUI terminal-state regressions", () => {
 				}
 			}
 		}
+	});
+});
+
+describe("foreground-tool streaming on ED3-risk terminals", () => {
+	beforeEach(() => {
+		let monotonicNow = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => {
+			monotonicNow += 20;
+			return monotonicNow;
+		});
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	// Repro of the "injected notification chip renders over the active tool
+	// render" report. A foreground tool (an active `write`) streams on an
+	// ED3-risk terminal (ghostty/kitty/…) whose viewport position is
+	// unobservable. Its header carries a live elapsed-time counter that ticks
+	// every frame; once output scrolls it above the viewport top, each tick is an
+	// OFFSCREEN edit. The agent requests an eager native-scrollback rebuild for
+	// the streaming turn, but that opt-in is gated off on ED3-risk terminals, so
+	// an offscreen-edit-with-growth frame repaints the viewport in place
+	// (`viewportRepaint`) — advancing the rendered line count WITHOUT committing
+	// the new overflow to native history. `#scrollbackHighWater` then lags the
+	// logical viewport top. A later shrink whose changes land in the visible
+	// region finds `naturalViewportTop >= #scrollbackHighWater`, slips past the
+	// shrink-across-boundary guard, and reaches the diff emitter, which anchors to
+	// `#maxLinesRendered - height`: it rewrites only the suffix, drops the newly
+	// exposed top row, and leaves a blank at the bottom — so every row below the
+	// edit renders one row too high, painting over the rows above. The shrink must
+	// instead re-anchor the bottom-anchored viewport.
+	it("re-anchors a visible-region shrink after an offscreen-edit grow lags native history", async () => {
+		await withTerminalRisk(true, async () => {
+			const term = new UnknownViewportTerminal(40, 6);
+			const tui = new TUI(term);
+			// done-* are completed messages that have scrolled into history; the
+			// "Write …s" header carries the ticking timer; code-* is the streamed
+			// preview; loader/todos/editor is the stable footer below the tool.
+			const frameA = [
+				"done-0",
+				"done-1",
+				"done-2",
+				"done-3",
+				"done-4",
+				"done-5",
+				"Write 0s",
+				"code-148",
+				"code-149",
+				"code-150",
+				"loader",
+				"todos",
+				"editor",
+			];
+			const component = new MutableLinesComponent(frameA);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				// Foreground tool active: the agent enables eager native-scrollback rebuild.
+				tui.setEagerNativeScrollbackRebuild(true);
+				await settle(term);
+				// The header has scrolled above the viewport top (offscreen).
+				expect(visible(term)).toEqual(["code-148", "code-149", "code-150", "loader", "todos", "editor"]);
+
+				// Frame B: the offscreen header ticks (0s -> 1s) AND four notification
+				// chips inject between the tool and the footer — an offscreen-edit grow
+				// that repaints in place and lags native history behind the new overflow.
+				const frameB = [
+					"done-0",
+					"done-1",
+					"done-2",
+					"done-3",
+					"done-4",
+					"done-5",
+					"Write 1s",
+					"code-148",
+					"code-149",
+					"code-150",
+					"chip-0",
+					"chip-1",
+					"chip-2",
+					"chip-3",
+					"loader",
+					"todos",
+					"editor",
+				];
+				component.setLines(frameB);
+				tui.requestRender();
+				await settle(term);
+				expect(visible(term)).toEqual(["chip-1", "chip-2", "chip-3", "loader", "todos", "editor"]);
+
+				// Frame C: a visible chip collapses (a shrink whose first change lands in
+				// the visible region) while the header does NOT tick this frame. The
+				// viewport must re-anchor one row up, not drift its content upward.
+				const frameC = [
+					"done-0",
+					"done-1",
+					"done-2",
+					"done-3",
+					"done-4",
+					"done-5",
+					"Write 1s",
+					"code-148",
+					"code-149",
+					"code-150",
+					"chip-0",
+					"chip-1",
+					"chip-2",
+					"loader",
+					"todos",
+					"editor",
+				];
+				component.setLines(frameC);
+				tui.requestRender();
+				await settle(term);
+				expect(visible(term)).toEqual(["chip-0", "chip-1", "chip-2", "loader", "todos", "editor"]);
+			} finally {
+				tui.stop();
+			}
+		});
 	});
 });

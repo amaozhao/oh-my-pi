@@ -1,19 +1,19 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { TERMINAL } from "../src/terminal-capabilities";
 import {
 	type Component,
 	CURSOR_MARKER,
-	Ellipsis,
-	extractSegments,
 	type Focusable,
 	type OverlayAnchor,
 	type OverlayHandle,
 	type OverlayOptions,
-	sliceByColumn,
-	sliceWithWidth,
 	TUI,
-	truncateToWidth,
-	visibleWidth,
-} from "@oh-my-pi/pi-tui";
+} from "../src/tui";
+import { Ellipsis, extractSegments, sliceByColumn, sliceWithWidth, truncateToWidth, visibleWidth } from "../src/utils";
+import { StressRenderScheduler } from "./render-stress-scheduler";
 import { VirtualTerminal, type VirtualTerminalWidthModel } from "./virtual-terminal";
 
 const BASE_SEEDS = [
@@ -35,7 +35,16 @@ const SMILE = String.fromCodePoint(0x1f642);
 type TestPlatform = "darwin" | "linux" | "win32";
 type TerminalMode = "normal" | "unknown" | "intermittentUnknown" | "staleBottom";
 type GeometryMode = "small" | "large";
-type EnvMode = "plain" | "tmux" | "termux" | "appleTerminal" | "iterm2" | "wsl";
+type EnvMode = "plain" | "tmux" | "termux" | "appleTerminal" | "iterm2" | "wsl" | "vteNoSync" | "ghostty";
+export type ScenarioTag =
+	| "small"
+	| "large"
+	| "tmux"
+	| "strictScrollback"
+	| "unknownViewport"
+	| "foregroundStream"
+	| "ed3Risk"
+	| "modernWidth";
 const ENV_KEYS = [
 	"TMUX",
 	"STY",
@@ -46,6 +55,7 @@ const ENV_KEYS = [
 	"GHOSTTY_RESOURCES_DIR",
 	"ALACRITTY_WINDOW_ID",
 	"VTE_VERSION",
+	"PI_NO_SYNC_OUTPUT",
 	"TERM_PROGRAM",
 	"ITERM_SESSION_ID",
 	"WT_SESSION",
@@ -57,7 +67,7 @@ type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 type JsonObject = { [key: string]: JsonValue };
 
-type OperationKind =
+export type OperationKind =
 	| "appendSmall"
 	| "appendExactWidth"
 	| "appendBulk"
@@ -106,6 +116,61 @@ type OperationKind =
 	| "reorderChildren"
 	| "mutateChild";
 
+export const OPERATION_KINDS = [
+	"appendSmall",
+	"appendExactWidth",
+	"appendBulk",
+	"streamOne",
+	"editVisibleLine",
+	"editOffscreenLine",
+	"offscreenEditAppendRepeatedTail",
+	"insertOffscreen",
+	"insertMiddle",
+	"deleteTrailing",
+	"deleteMiddle",
+	"replaceAll",
+	"toggleCollapsible",
+	"tickStatusHeader",
+	"appendRepeatedTail",
+	"injectBlankCluster",
+	"appendDuplicateOfExisting",
+	"highWaterPreviewCollapse",
+	"eagerStreamingMutation",
+	"scrollUp",
+	"scrollToBottom",
+	"scrollPartial",
+	"resizeWidth",
+	"resizeHeight",
+	"resizeWithAppend",
+	"forceRender",
+	"toggleFocusInput",
+	"moveCursorVisible",
+	"moveCursorOffscreen",
+	"showOverlay",
+	"hideOverlay",
+	"toggleOverlayHidden",
+	"editOverlay",
+	"moveOverlayCursor",
+	"coalescedBurst",
+	"rotateUp",
+	"collapseToFew",
+	"swapOffscreenRows",
+	"resizeBoth",
+	"resizeNoop",
+	"forceRenderAllowUnknown",
+	"forceRenderClearScrollback",
+	"forceRenderAfterEmptyOverflow",
+	"attachChild",
+	"detachChild",
+	"reorderChildren",
+	"mutateChild",
+] as const satisfies readonly OperationKind[];
+const OPERATION_KIND_SET = new Set<string>(OPERATION_KINDS);
+
+export function isOperationKind(value: unknown): value is OperationKind {
+	return typeof value === "string" && OPERATION_KIND_SET.has(value);
+}
+
 const BURST_STEP_KINDS = [
 	"appendSmall",
 	"streamOne",
@@ -133,20 +198,20 @@ const OVERLAY_ANCHORS = [
 	"right-center",
 ] as const satisfies readonly OverlayAnchor[];
 const CURSOR_MODES = ["start", "middle", "end", "wideBoundary"] as const;
-type CursorMode = (typeof CURSOR_MODES)[number];
+export type CursorMode = (typeof CURSOR_MODES)[number];
 
-interface ExpectedCursor {
+export interface ExpectedCursor {
 	row: number;
 	col: number;
 }
 
-interface ExpectedFrame {
+export interface ExpectedFrame {
 	frame: string[];
 	cursor: ExpectedCursor | null;
-	// Frame rows whose logical content carries background SGR. Only these rows
-	// may have background-colored cells in the terminal; anywhere else is BCE
-	// bleed (leaked SGR state painting erased cells).
-	backgroundRows: boolean[];
+	// Frame columns whose logical content carries background SGR. Only these
+	// cells may have non-default background in the terminal; background outside
+	// these column ranges is BCE bleed from stale SGR state painting erased cells.
+	backgroundColumns: number[][];
 }
 
 interface StressOverlayEntry {
@@ -194,13 +259,44 @@ export interface Scenario {
 	strictScrollback: boolean;
 	timeoutMs: number;
 	uniqueContent: boolean;
+	// Models a foreground tool actively streaming output: the agent sets
+	// `setEagerNativeScrollbackRebuild(true)` for the whole turn and re-renders
+	// content frames with a plain (non-forced) `requestRender()`. On an ED3-risk
+	// terminal (ghostty/kitty/…) the eager opt-in is gated off by
+	// `eagerEraseScrollbackRisk`, so `allowUnknownViewportMutation` stays false and
+	// offscreen-edit growth flows through `viewportRepaint` (which advances the
+	// rendered line count without committing the overflow to native history).
+	// The default content-frame path instead forces `allowUnknownViewportMutation`
+	// and never exercises that lagging-high-water state.
+	foregroundStream: boolean;
+	// Renders each logical line wrapped to the viewport width, so a width resize
+	// changes the physical line COUNT (reflow), not just per-row truncation —
+	// exercising the geometry-change + line-count-change interaction the
+	// fixed-line components never produced. Paired with the modern width model so
+	// the wrap agrees with the terminal's cell widths.
+	reflow: boolean;
+	tags: readonly ScenarioTag[];
+	replayOperations?: readonly OperationKind[];
+}
+
+type ViewportProbeTrait = "known" | "unknown" | "intermittentUnknown" | "staleBottom";
+
+interface TerminalStressTraits {
+	readonly preservesPaneHistory: boolean;
+	readonly strictNativeScrollback: boolean;
+	readonly syncOutputDisabled: boolean;
+	readonly viewportProbe: ViewportProbeTrait;
+	readonly ed3ScrollbackEraseRisk: boolean;
+	readonly conptyHostScrollbackUnobservable: boolean;
+	readonly foregroundStreaming: boolean;
+	readonly widthModel: VirtualTerminalWidthModel;
 }
 
 interface Snapshot {
 	buffer: string[];
 	view: string[];
 	viewBackgroundColumns: number[][];
-	frameBackgroundRows: boolean[];
+	frameBackgroundColumns: number[][];
 	position: { baseY: number; viewportY: number };
 	cursor: { row: number; col: number };
 	expectedCursor: ExpectedCursor | null;
@@ -228,11 +324,66 @@ interface AppliedOperation {
 	// retracted from multiplexer pane history, so growth oracles must allow
 	// them. Defaults to the net frame growth when absent.
 	transientFrameGrowth?: number;
+	// The periodic prompt-submit checkpoint pins the viewport to the bottom and
+	// runs the real reconciliation (`refreshNativeScrollbackIfDirty` outside
+	// `normal`, a `/clear`-style forced rebuild for `normal`), so native
+	// scrollback must equal the transcript afterward. Plain `scrollToBottom` /
+	// forced-render ops also set `checkpoint`, but on Windows hosts a forced
+	// render cannot rebuild ConPTY-hidden history (it defers to the next submit),
+	// so the clean-buffer oracle keys on this flag for non-`normal` scenarios.
+	reconcilesNativeScrollback?: boolean;
 }
+
+type AppliedOperationOverrides = Partial<Omit<AppliedOperation, "kind" | "detail">>;
+
+function appliedOperation(
+	kind: OperationKind,
+	detail: JsonObject,
+	overrides: AppliedOperationOverrides,
+): AppliedOperation {
+	return {
+		kind,
+		detail,
+		mutatesContent: false,
+		checksRowAccounting: false,
+		geometryChanged: false,
+		forcedRender: false,
+		checkpoint: false,
+		mutatesViewport: false,
+		...overrides,
+	};
+}
+
+function contentOperation(
+	kind: OperationKind,
+	detail: JsonObject,
+	checksRowAccounting: boolean,
+	overrides: AppliedOperationOverrides = {},
+): AppliedOperation {
+	return appliedOperation(kind, detail, { mutatesContent: true, checksRowAccounting, ...overrides });
+}
+
+function viewOperation(
+	kind: OperationKind,
+	detail: JsonObject,
+	overrides: AppliedOperationOverrides = {},
+): AppliedOperation {
+	return appliedOperation(kind, detail, overrides);
+}
+
+function forceRenderOperation(
+	kind: OperationKind,
+	detail: JsonObject,
+	overrides: AppliedOperationOverrides = {},
+): AppliedOperation {
+	return appliedOperation(kind, detail, { forcedRender: true, ...overrides });
+}
+
+type OperationLogKind = OperationKind | "periodicCheckpoint";
 
 interface OperationLogEntry {
 	index: number;
-	kind: OperationKind | "periodicCheckpoint";
+	kind: OperationLogKind;
 	detail: JsonObject;
 	frameLengthBefore: number;
 	frameLengthAfter: number;
@@ -245,6 +396,28 @@ interface OperationLogEntry {
 	redrawsBefore: number;
 	redrawsAfter: number;
 }
+
+interface BurstStepMetadata {
+	readonly mutatesContent: boolean;
+	readonly geometryChanged: boolean;
+	readonly forcedRender: boolean;
+	readonly mutatesViewport: boolean;
+}
+
+const BURST_STEP_METADATA = {
+	appendSmall: { mutatesContent: true, geometryChanged: false, forcedRender: false, mutatesViewport: false },
+	streamOne: { mutatesContent: true, geometryChanged: false, forcedRender: false, mutatesViewport: false },
+	appendRepeatedTail: { mutatesContent: true, geometryChanged: false, forcedRender: false, mutatesViewport: false },
+	injectBlankCluster: { mutatesContent: true, geometryChanged: false, forcedRender: false, mutatesViewport: false },
+	editVisibleLine: { mutatesContent: true, geometryChanged: false, forcedRender: false, mutatesViewport: false },
+	editOffscreenLine: { mutatesContent: true, geometryChanged: false, forcedRender: false, mutatesViewport: false },
+	tickStatusHeader: { mutatesContent: true, geometryChanged: false, forcedRender: false, mutatesViewport: false },
+	resizeWidth: { mutatesContent: false, geometryChanged: true, forcedRender: false, mutatesViewport: true },
+	resizeHeight: { mutatesContent: false, geometryChanged: true, forcedRender: false, mutatesViewport: true },
+	scrollPartial: { mutatesContent: false, geometryChanged: false, forcedRender: false, mutatesViewport: true },
+	scrollToBottom: { mutatesContent: false, geometryChanged: false, forcedRender: false, mutatesViewport: true },
+	forceRender: { mutatesContent: false, geometryChanged: false, forcedRender: true, mutatesViewport: true },
+} satisfies Record<BurstStepKind, BurstStepMetadata>;
 
 class UnknownViewportTerminal extends VirtualTerminal {
 	isNativeViewportAtBottom(): undefined {
@@ -327,6 +500,93 @@ class Rng {
 		}
 		return items[this.int(0, items.length - 1)]!;
 	}
+}
+
+interface StressRandomStreams {
+	readonly ops: Rng;
+	readonly content: Rng;
+	readonly overlay: Rng;
+	readonly geometry: Rng;
+	readonly cursor: Rng;
+	readonly children: Rng;
+}
+
+function createRandomStreams(seed: number): StressRandomStreams {
+	return {
+		ops: new Rng(mixSeed(seed, 0x01)),
+		content: new Rng(mixSeed(seed, 0x02)),
+		overlay: new Rng(mixSeed(seed, 0x03)),
+		geometry: new Rng(mixSeed(seed, 0x04)),
+		cursor: new Rng(mixSeed(seed, 0x05)),
+		children: new Rng(mixSeed(seed, 0x06)),
+	};
+}
+
+function mixSeed(seed: number, stream: number): number {
+	let mixed = (seed ^ Math.imul(stream, 0x9e3779b9)) >>> 0;
+	mixed = Math.imul(mixed ^ (mixed >>> 16), 0x7feb352d);
+	mixed = Math.imul(mixed ^ (mixed >>> 15), 0x846ca68b);
+	return (mixed ^ (mixed >>> 16)) >>> 0;
+}
+
+function isEd3RiskScenario(terminalMode: TerminalMode, envMode: EnvMode): boolean {
+	return (
+		terminalMode === "unknown" &&
+		(envMode === "appleTerminal" || envMode === "iterm2" || envMode === "wsl" || envMode === "ghostty")
+	);
+}
+
+interface WeightedCandidate<T> {
+	readonly item: T;
+	readonly weight: number;
+}
+
+function weightedPick<T>(rng: Rng, items: readonly WeightedCandidate<T>[]): T {
+	let total = 0;
+	for (const entry of items) {
+		total += Math.max(0, entry.weight);
+	}
+	if (total <= 0) throw new Error("No weighted candidates");
+
+	let roll = rng.next() * total;
+	for (const entry of items) {
+		const weight = Math.max(0, entry.weight);
+		roll -= weight;
+		if (roll < 0) return entry.item;
+	}
+	return items[items.length - 1]!.item;
+}
+
+function assertNever(value: never): never {
+	throw new Error(`Unexpected value: ${String(value)}`);
+}
+
+function terminalStressTraits(scenario: Scenario): TerminalStressTraits {
+	return {
+		preservesPaneHistory: scenario.envMode === "tmux",
+		strictNativeScrollback: scenario.strictScrollback,
+		syncOutputDisabled: scenario.envMode === "vteNoSync",
+		viewportProbe: scenario.terminalMode === "normal" ? "known" : scenario.terminalMode,
+		ed3ScrollbackEraseRisk: isEd3RiskScenario(scenario.terminalMode, scenario.envMode),
+		conptyHostScrollbackUnobservable: scenario.platform === "win32" && scenario.terminalMode === "unknown",
+		foregroundStreaming: scenario.foregroundStream,
+		widthModel: scenario.widthModel ?? "legacy",
+	};
+}
+
+function scenarioTags(
+	template: Pick<Scenario, "envMode" | "terminalMode" | "geometryMode" | "widthModel">,
+	strictNativeScrollback: boolean,
+	foregroundStreaming: boolean,
+): readonly ScenarioTag[] {
+	const tags: ScenarioTag[] = [template.geometryMode];
+	if (template.envMode === "tmux") tags.push("tmux");
+	if (strictNativeScrollback) tags.push("strictScrollback");
+	if (template.terminalMode !== "normal") tags.push("unknownViewport");
+	if (foregroundStreaming) tags.push("foregroundStream");
+	if (isEd3RiskScenario(template.terminalMode, template.envMode)) tags.push("ed3Risk");
+	if (template.widthModel === "modern") tags.push("modernWidth");
+	return tags;
 }
 
 class StressModel {
@@ -701,18 +961,42 @@ class StressModel {
 	}
 }
 
+// Wrap a rendered line set to the viewport width, ANSI- and grapheme-aware, so
+// a logical line can occupy a width-dependent NUMBER of physical rows — the
+// reflow that real wrapped/markdown content performs and that fixed-line
+// components never exercised. Because BOTH the live render and the expected
+// frame run through this same deterministic transform (StressComponent.render),
+// the geometric oracles stay consistent; the renderer's own truncation
+// normalizes any residual width-model disagreement on each physical row.
+function reflowToWidth(lines: readonly string[], width: number): string[] {
+	const target = Math.max(1, width);
+	const out: string[] = [];
+	for (const line of lines) {
+		if (line.length === 0) {
+			out.push("");
+			continue;
+		}
+		const wrapped = Bun.wrapAnsi(line, target, { hard: true, wordWrap: false, trim: false });
+		for (const physical of wrapped.split("\n")) out.push(physical);
+	}
+	return out;
+}
+
 class StressComponent implements Component, Focusable {
 	focused = false;
 	#model: StressModel;
+	#reflow: boolean;
 
-	constructor(model: StressModel) {
+	constructor(model: StressModel, reflow = false) {
 		this.#model = model;
+		this.#reflow = reflow;
 	}
 
 	invalidate(): void {}
 
 	render(width: number): string[] {
-		return this.#model.renderedLines(width, this.focused);
+		const lines = this.#model.renderedLines(width, this.focused);
+		return this.#reflow ? reflowToWidth(lines, width) : lines;
 	}
 }
 
@@ -819,7 +1103,9 @@ class StressOverlayComponent implements Component, Focusable {
 
 class StressDriver {
 	#scenario: Scenario;
-	#rng: Rng;
+	#streams: StressRandomStreams;
+	#traits: TerminalStressTraits;
+	#scheduler: StressRenderScheduler;
 	#term: VirtualTerminal;
 	#tui: TUI;
 	#model: StressModel;
@@ -829,6 +1115,7 @@ class StressDriver {
 	#hiddenOverlaySentinels = new Set<string>();
 	#nextOverlayId = 0;
 	#opLog: OperationLogEntry[] = [];
+	#operationCoverage = new Map<OperationLogKind, number>();
 	// Lines that legitimately appeared 2+ times in any committed frame. Native
 	// scrollback retains rows from every past frame — content that leaves the
 	// frame (a detached child, collapsed preview, truncation-colliding rows
@@ -838,9 +1125,11 @@ class StressDriver {
 	#everDuplicatedFrameLines = new Set<string>();
 	#nativeScrollbackAuditBlocked = false;
 	// Every byte the renderer wrote to the terminal, in order. The sync-output
-	// discipline oracle audits bracket balance incrementally from #writeLogScanned.
+	// discipline oracle audits bracket balance incrementally from #writeLogScanned
+	// and carries partial private CSI sequences across write chunks.
 	#writeLog: string[] = [];
 	#writeLogScanned = 0;
+	#ansiCarry = "";
 	// Running depth of synchronized-output (DEC 2026) and autowrap-disable (DECAWM)
 	// brackets across the whole session; both must return to 0 at every op
 	// boundary and never go out of {0,1}.
@@ -849,18 +1138,20 @@ class StressDriver {
 
 	constructor(scenario: Scenario) {
 		this.#scenario = scenario;
-		this.#rng = new Rng(scenario.seed);
+		this.#streams = createRandomStreams(scenario.seed);
+		this.#traits = terminalStressTraits(scenario);
+		this.#scheduler = new StressRenderScheduler();
 		const maxHeight = maxOf(scenario.heightChoices);
-		this.#model = new StressModel(this.#rng, maxHeight + 12, scenario.uniqueContent, "root-");
-		this.#component = new StressComponent(this.#model);
+		this.#model = new StressModel(this.#streams.content, maxHeight + 12, scenario.uniqueContent, "root-");
+		this.#component = new StressComponent(this.#model, scenario.reflow);
 		this.#children = [0, 1].map(id => {
 			const model = new StressModel(
-				this.#rng,
+				this.#streams.children,
 				Math.max(1, Math.min(3, maxHeight)),
 				scenario.uniqueContent,
 				`child${id}-`,
 			);
-			return { id, model, component: new StressComponent(model), active: false };
+			return { id, model, component: new StressComponent(model, scenario.reflow), active: false };
 		});
 		this.#term = createTerminal(scenario);
 		// Capture every byte written to the terminal so per-op oracles can audit
@@ -870,14 +1161,23 @@ class StressDriver {
 			this.#writeLog.push(data);
 			realWrite(data);
 		};
-		this.#tui = new TUI(this.#term, true);
+		this.#tui = new TUI(this.#term, true, { renderScheduler: this.#scheduler });
 		this.#tui.addChild(this.#component);
 	}
 
 	async run(): Promise<void> {
+		// Foreground-tool streaming faithfully: pin the ED3-risk trait (independent
+		// of whatever real terminal hosts the worker) and keep the turn-long eager
+		// rebuild opt-in enabled. On an ED3-risk terminal that opt-in is gated off,
+		// so content frames flow through `viewportRepaint`/`diff` rather than a
+		// forced history rebuild — see `#renderContentFrame`.
+		const terminalInfo = TERMINAL as unknown as { eagerEraseScrollbackRisk: boolean };
+		const savedRisk = terminalInfo.eagerEraseScrollbackRisk;
+		if (this.#traits.foregroundStreaming) terminalInfo.eagerEraseScrollbackRisk = this.#traits.ed3ScrollbackEraseRisk;
 		try {
 			this.#tui.start();
-			await settle(this.#term);
+			if (this.#traits.foregroundStreaming) this.#tui.setEagerNativeScrollbackRebuild(true);
+			await this.#settle();
 			this.#assertOracles(
 				{
 					kind: "forceRender",
@@ -896,7 +1196,7 @@ class StressDriver {
 
 			for (let index = 0; index < this.#scenario.iterations; index++) {
 				const before = this.#snapshot();
-				const kind = this.#chooseOperation(index, before);
+				const kind = this.#scenario.replayOperations?.[index] ?? this.#chooseOperation(index, before);
 				const op = await this.#applyOperation(kind);
 				const after = this.#snapshot();
 				this.#recordOperation(index, op.kind, op.detail, before, after);
@@ -909,6 +1209,7 @@ class StressDriver {
 		} finally {
 			this.#tui.stop();
 			await this.#term.flush();
+			terminalInfo.eagerEraseScrollbackRisk = savedRisk;
 		}
 	}
 
@@ -925,10 +1226,10 @@ class StressDriver {
 		// oracle only checks live viewport behavior; avoid repeatedly materializing
 		// huge preserved pane history that no invariant consumes.
 		return {
-			buffer: this.#scenario.envMode === "tmux" ? view : normalizeLines(this.#term.getScrollBuffer()),
+			buffer: this.#traits.preservesPaneHistory ? view : normalizeLines(this.#term.getScrollBuffer()),
 			view,
 			viewBackgroundColumns,
-			frameBackgroundRows: expected.backgroundRows,
+			frameBackgroundColumns: expected.backgroundColumns,
 			position,
 			cursor: this.#term.getCursor(),
 			expectedCursor: expected.cursor,
@@ -959,23 +1260,23 @@ class StressDriver {
 		return this.#overlays.some(entry => isExpectedOverlayVisible(entry, this.#term.columns, this.#term.rows));
 	}
 
-	#isUnknownEd3RiskScenario(): boolean {
-		return (
-			this.#scenario.terminalMode === "unknown" &&
-			(this.#scenario.envMode === "appleTerminal" ||
-				this.#scenario.envMode === "iterm2" ||
-				this.#scenario.envMode === "wsl")
-		);
+	#settle(): Promise<void> {
+		return this.#scheduler.drain(this.#term);
 	}
 
 	#chooseOperation(index: number, before: Snapshot): OperationKind {
-		if (this.#isUnknownEd3RiskScenario() && before.position.baseY > 0) {
+		if (
+			(this.#traits.ed3ScrollbackEraseRisk || this.#traits.conptyHostScrollbackUnobservable) &&
+			before.position.baseY > 0
+		) {
 			if (before.atBottom && index % 47 === 0) return "scrollUp";
-			if (!before.atBottom && index % 47 === 1) return "eagerStreamingMutation";
+			if (!before.atBottom && index % 47 === 1) {
+				return this.#traits.foregroundStreaming ? "streamOne" : "eagerStreamingMutation";
+			}
 		}
 
 		if (
-			this.#scenario.strictScrollback &&
+			this.#traits.strictNativeScrollback &&
 			before.atBottom &&
 			before.frame.length > before.height + 8 &&
 			index % 43 === 0
@@ -983,7 +1284,7 @@ class StressDriver {
 			return "collapseToFew";
 		}
 		if (
-			this.#scenario.strictScrollback &&
+			this.#traits.strictNativeScrollback &&
 			before.atBottom &&
 			before.frame.length > before.height + 8 &&
 			!this.#hasVisibleOverlay() &&
@@ -991,74 +1292,75 @@ class StressDriver {
 		) {
 			return "highWaterPreviewCollapse";
 		}
-		if (this.#scenario.strictScrollback && before.atBottom && index % 41 === 0) {
+		if (this.#traits.strictNativeScrollback && before.atBottom && index % 41 === 0) {
 			return "offscreenEditAppendRepeatedTail";
 		}
-		if (!before.atBottom && this.#rng.chance(0.28)) {
+		if (!before.atBottom && this.#streams.ops.chance(0.28)) {
 			return "scrollToBottom";
 		}
 
-		const weighted: OperationKind[] = [];
-		this.#pushWeighted(weighted, "appendSmall", 14);
-		this.#pushWeighted(weighted, "streamOne", 12);
 		// Exact-width rows are the pending-wrap / DECAWM boundary case: a row whose
 		// visible width equals the terminal width writes its last cell, latching
 		// pending-wrap on autowrap terminals so a following cursor move can wrap and
 		// staircase. The renderer disables autowrap around paints (\x1b[?7l). Skipped
 		// for uniqueContent scenarios — at width 1-2 the finite cell alphabet cannot
 		// stay unique across hundreds of ops.
-		this.#pushWeighted(weighted, "appendExactWidth", this.#scenario.uniqueContent ? 0 : 5);
-		this.#pushWeighted(weighted, "appendRepeatedTail", this.#scenario.uniqueContent ? 2 : 8);
-		this.#pushWeighted(weighted, "appendDuplicateOfExisting", this.#scenario.uniqueContent ? 2 : 8);
-		this.#pushWeighted(weighted, "injectBlankCluster", 5);
-		this.#pushWeighted(weighted, "appendBulk", 3);
-		this.#pushWeighted(weighted, "editVisibleLine", 8);
-		this.#pushWeighted(weighted, "editOffscreenLine", 7);
-		this.#pushWeighted(weighted, "offscreenEditAppendRepeatedTail", 5);
-		this.#pushWeighted(weighted, "insertOffscreen", 3);
-		this.#pushWeighted(weighted, "insertMiddle", 2);
-		this.#pushWeighted(weighted, "deleteTrailing", 3);
-		this.#pushWeighted(weighted, "deleteMiddle", 2);
-		this.#pushWeighted(weighted, "replaceAll", 1);
-		this.#pushWeighted(weighted, "toggleCollapsible", 2);
-		this.#pushWeighted(weighted, "tickStatusHeader", 8);
-		this.#pushWeighted(weighted, "scrollUp", before.position.baseY > 0 ? 4 : 0);
-		this.#pushWeighted(weighted, "scrollPartial", before.position.baseY > 0 ? 3 : 0);
-		this.#pushWeighted(weighted, "scrollToBottom", before.atBottom ? 2 : 8);
-		this.#pushWeighted(weighted, "resizeWidth", 3);
-		this.#pushWeighted(weighted, "resizeHeight", 3);
-		this.#pushWeighted(weighted, "forceRender", 2);
-		this.#pushWeighted(weighted, "forceRenderAllowUnknown", 2);
-		this.#pushWeighted(weighted, "forceRenderClearScrollback", 1);
-		this.#pushWeighted(weighted, "forceRenderAfterEmptyOverflow", 1);
-		this.#pushWeighted(weighted, "toggleFocusInput", 2);
-		this.#pushWeighted(weighted, "moveCursorVisible", 3);
-		this.#pushWeighted(weighted, "moveCursorOffscreen", 2);
-		this.#pushWeighted(weighted, "showOverlay", this.#overlays.length < 2 ? 3 : 1);
-		this.#pushWeighted(weighted, "hideOverlay", this.#overlays.length > 0 ? 2 : 0);
-		this.#pushWeighted(weighted, "toggleOverlayHidden", this.#overlays.length > 0 ? 2 : 0);
-		this.#pushWeighted(weighted, "editOverlay", this.#overlays.length > 0 ? 4 : 0);
-		this.#pushWeighted(weighted, "moveOverlayCursor", this.#overlays.length > 0 ? 2 : 0);
-		this.#pushWeighted(weighted, "coalescedBurst", 6);
-		this.#pushWeighted(weighted, "rotateUp", 4);
-		this.#pushWeighted(weighted, "swapOffscreenRows", 3);
-		this.#pushWeighted(weighted, "collapseToFew", 1);
-		this.#pushWeighted(weighted, "highWaterPreviewCollapse", 2);
-		this.#pushWeighted(weighted, "eagerStreamingMutation", this.#scenario.envMode === "tmux" ? 0 : 3);
-		this.#pushWeighted(weighted, "resizeBoth", 2);
-		this.#pushWeighted(weighted, "resizeNoop", 1);
-		this.#pushWeighted(weighted, "resizeWithAppend", 2);
-		this.#pushWeighted(weighted, "attachChild", this.#children.some(child => !child.active) ? 2 : 0);
-		this.#pushWeighted(weighted, "detachChild", this.#children.some(child => child.active) ? 2 : 0);
-		this.#pushWeighted(weighted, "reorderChildren", this.#children.filter(child => child.active).length > 1 ? 1 : 0);
-		this.#pushWeighted(weighted, "mutateChild", this.#children.some(child => child.active) ? 3 : 0);
-		return this.#rng.pick(weighted);
-	}
-
-	#pushWeighted(target: OperationKind[], kind: OperationKind, weight: number): void {
-		for (let i = 0; i < weight; i++) {
-			target.push(kind);
-		}
+		const weighted: readonly WeightedCandidate<OperationKind>[] = [
+			{ item: "appendSmall", weight: 14 },
+			{ item: "streamOne", weight: 12 },
+			{ item: "appendExactWidth", weight: this.#scenario.uniqueContent ? 0 : 5 },
+			{ item: "appendRepeatedTail", weight: this.#scenario.uniqueContent ? 2 : 8 },
+			{ item: "appendDuplicateOfExisting", weight: this.#scenario.uniqueContent ? 2 : 8 },
+			{ item: "injectBlankCluster", weight: 5 },
+			{ item: "appendBulk", weight: 3 },
+			{ item: "editVisibleLine", weight: 8 },
+			{ item: "editOffscreenLine", weight: 7 },
+			{ item: "offscreenEditAppendRepeatedTail", weight: 5 },
+			{ item: "insertOffscreen", weight: 3 },
+			{ item: "insertMiddle", weight: 2 },
+			{ item: "deleteTrailing", weight: 3 },
+			{ item: "deleteMiddle", weight: 2 },
+			{ item: "replaceAll", weight: 1 },
+			{ item: "toggleCollapsible", weight: 2 },
+			{ item: "tickStatusHeader", weight: 8 },
+			{ item: "scrollUp", weight: before.position.baseY > 0 ? 4 : 0 },
+			{ item: "scrollPartial", weight: before.position.baseY > 0 ? 3 : 0 },
+			{ item: "scrollToBottom", weight: before.atBottom ? 2 : 8 },
+			{ item: "resizeWidth", weight: 3 },
+			{ item: "resizeHeight", weight: 3 },
+			{ item: "forceRender", weight: 2 },
+			{ item: "forceRenderAllowUnknown", weight: 2 },
+			{ item: "forceRenderClearScrollback", weight: 1 },
+			{ item: "forceRenderAfterEmptyOverflow", weight: 1 },
+			{ item: "toggleFocusInput", weight: 2 },
+			{ item: "moveCursorVisible", weight: 3 },
+			{ item: "moveCursorOffscreen", weight: 2 },
+			{ item: "showOverlay", weight: this.#overlays.length < 2 ? 3 : 1 },
+			{ item: "hideOverlay", weight: this.#overlays.length > 0 ? 2 : 0 },
+			{ item: "toggleOverlayHidden", weight: this.#overlays.length > 0 ? 2 : 0 },
+			{ item: "editOverlay", weight: this.#overlays.length > 0 ? 4 : 0 },
+			{ item: "moveOverlayCursor", weight: this.#overlays.length > 0 ? 2 : 0 },
+			{ item: "coalescedBurst", weight: 6 },
+			{ item: "rotateUp", weight: 4 },
+			{ item: "swapOffscreenRows", weight: 3 },
+			{ item: "collapseToFew", weight: 1 },
+			{ item: "highWaterPreviewCollapse", weight: 2 },
+			// `eagerStreamingMutation` toggles the eager opt-in off in its `finally`,
+			// which would end the modeled foreground-tool turn early; a foregroundStream
+			// scenario keeps the opt-in on for its whole run, so skip it there.
+			{
+				item: "eagerStreamingMutation",
+				weight: this.#traits.preservesPaneHistory || this.#traits.foregroundStreaming ? 0 : 3,
+			},
+			{ item: "resizeBoth", weight: 2 },
+			{ item: "resizeNoop", weight: 1 },
+			{ item: "resizeWithAppend", weight: 2 },
+			{ item: "attachChild", weight: this.#children.some(child => !child.active) ? 2 : 0 },
+			{ item: "detachChild", weight: this.#children.some(child => child.active) ? 2 : 0 },
+			{ item: "reorderChildren", weight: this.#children.filter(child => child.active).length > 1 ? 1 : 0 },
+			{ item: "mutateChild", weight: this.#children.some(child => child.active) ? 3 : 0 },
+		];
+		return weightedPick(this.#streams.ops, weighted);
 	}
 
 	async #applyOperation(kind: OperationKind): Promise<AppliedOperation> {
@@ -1157,6 +1459,8 @@ class StressDriver {
 				return await this.#reorderChildren();
 			case "mutateChild":
 				return await this.#mutateChild();
+			default:
+				return assertNever(kind);
 		}
 	}
 
@@ -1166,48 +1470,44 @@ class StressDriver {
 		checksRowAccounting: boolean,
 	): Promise<AppliedOperation> {
 		this.#renderContentFrame();
-		await settle(this.#term);
-		return {
-			kind,
-			detail,
-			mutatesContent: true,
-			checksRowAccounting,
-			geometryChanged: false,
-			forcedRender: false,
-			mutatesViewport: false,
-			checkpoint: false,
-		};
+		await this.#settle();
+		return contentOperation(kind, detail, checksRowAccounting);
 	}
 
 	async #eagerStreamingMutation(): Promise<AppliedOperation> {
 		this.#tui.setEagerNativeScrollbackRebuild(true);
 		let detail: JsonObject = {};
 		try {
-			detail = this.#rng.chance(0.5) ? this.#model.streamOne() : this.#model.editOffscreenLine(this.#term.rows);
+			detail = this.#streams.content.chance(0.5)
+				? this.#model.streamOne()
+				: this.#model.editOffscreenLine(this.#term.rows);
 			this.#renderContentFrame();
-			await settle(this.#term);
+			await this.#settle();
 		} finally {
 			this.#tui.setEagerNativeScrollbackRebuild(false);
 		}
-		return {
-			kind: "eagerStreamingMutation",
-			detail,
-			mutatesContent: true,
-			checksRowAccounting: false,
-			geometryChanged: false,
-			forcedRender: false,
-			mutatesViewport: false,
-			checkpoint: false,
-		};
+		return contentOperation("eagerStreamingMutation", detail, false);
 	}
 
 	#renderContentFrame(): void {
+		if (this.#traits.foregroundStreaming) {
+			// A foreground tool's own re-render: a plain, non-forced request with the
+			// turn-long eager opt-in already enabled. We deliberately do NOT pass
+			// `allowUnknownViewportMutation` — on an ED3-risk terminal the eager
+			// opt-in is gated off, so the renderer keeps the live tail through
+			// `viewportRepaint`/`diff`. Offscreen-edit growth then flows through
+			// `viewportRepaint`, advancing the rendered line count without committing
+			// the overflow to native history, which is the lagging-high-water state a
+			// later shrink must still re-anchor from.
+			this.#tui.requestRender(false);
+			return;
+		}
 		const position = this.#term.getBufferPosition();
 		const atBottom = position.viewportY >= position.baseY;
-		if (!this.#scenario.strictScrollback && atBottom) {
+		if (!this.#traits.strictNativeScrollback && atBottom) {
 			this.#tui.requestRender(true, { allowUnknownViewportMutation: true });
 		} else {
-			const allowUnknownViewportMutation = this.#scenario.terminalMode === "unknown" && atBottom;
+			const allowUnknownViewportMutation = this.#traits.viewportProbe === "unknown" && atBottom;
 			this.#tui.requestRender(
 				false,
 				allowUnknownViewportMutation ? { allowUnknownViewportMutation: true } : undefined,
@@ -1225,12 +1525,12 @@ class StressDriver {
 		const begin = this.#model.beginHighWaterPreview(this.#term.rows);
 		const expandedFrameGrowth = this.#model.lines.length - lengthBeforeBegin;
 		this.#renderContentFrame();
-		await settle(this.#term);
+		await this.#settle();
 		const start = typeof begin.start === "number" ? begin.start : 0;
 		const count = typeof begin.count === "number" ? begin.count : 0;
 		const collapse = this.#model.collapseHighWaterPreview(start, count);
 		this.#renderContentFrame();
-		await settle(this.#term);
+		await this.#settle();
 		return {
 			kind: "highWaterPreviewCollapse",
 			detail: { begin, collapse },
@@ -1248,35 +1548,26 @@ class StressDriver {
 	}
 
 	async #coalescedBurst(): Promise<AppliedOperation> {
-		const count = this.#rng.int(2, 6);
+		const count = this.#streams.ops.int(2, 6);
 		const steps: JsonValue[] = [];
 		let mutatesContent = false;
 		let geometryChanged = false;
 		let forcedRender = false;
 		let mutatesViewport = false;
 		for (let i = 0; i < count; i++) {
-			const stepKind = this.#rng.pick(BURST_STEP_KINDS);
+			const stepKind = this.#streams.ops.pick(BURST_STEP_KINDS);
 			const detail = this.#applyBurstStep(stepKind);
 			steps.push({ kind: stepKind, detail });
-			mutatesContent ||=
-				stepKind !== "resizeWidth" &&
-				stepKind !== "resizeHeight" &&
-				stepKind !== "scrollPartial" &&
-				stepKind !== "scrollToBottom" &&
-				stepKind !== "forceRender";
-			geometryChanged ||= stepKind === "resizeWidth" || stepKind === "resizeHeight";
-			mutatesViewport ||=
-				stepKind === "resizeWidth" ||
-				stepKind === "resizeHeight" ||
-				stepKind === "scrollPartial" ||
-				stepKind === "scrollToBottom" ||
-				stepKind === "forceRender";
-			forcedRender ||= stepKind === "forceRender";
+			const metadata = BURST_STEP_METADATA[stepKind];
+			mutatesContent ||= metadata.mutatesContent;
+			geometryChanged ||= metadata.geometryChanged;
+			mutatesViewport ||= metadata.mutatesViewport;
+			forcedRender ||= metadata.forcedRender;
 			// Schedule without settling so the throttle coalesces every step into one paint.
 			if (stepKind !== "forceRender") this.#tui.requestRender();
 		}
 		this.#renderContentFrame();
-		await settle(this.#term);
+		await this.#settle();
 		return {
 			kind: "coalescedBurst",
 			detail: { count, steps },
@@ -1317,8 +1608,8 @@ class StressDriver {
 				return { rows };
 			}
 			case "scrollPartial": {
-				const amount = this.#rng.int(1, Math.max(1, this.#term.rows));
-				const direction = this.#rng.chance(0.5) ? -1 : 1;
+				const amount = this.#streams.geometry.int(1, Math.max(1, this.#term.rows));
+				const direction = this.#streams.geometry.chance(0.5) ? -1 : 1;
 				this.#term.scrollLines(direction * amount);
 				return { amount: direction * amount };
 			}
@@ -1328,6 +1619,8 @@ class StressDriver {
 			case "forceRender":
 				this.#tui.requestRender(true, { allowUnknownViewportMutation: true });
 				return { allowUnknownViewportMutation: true };
+			default:
+				return assertNever(kind);
 		}
 	}
 
@@ -1340,14 +1633,14 @@ class StressDriver {
 			: this.#model.setCursorVisible(this.#term.rows, this.#term.columns);
 		this.#tui.setFocus(this.#component);
 		this.#tui.requestRender(false, { allowUnknownViewportMutation: true });
-		await settle(this.#term);
+		await this.#settle();
 		return this.#viewOperation(kind, { cursor });
 	}
 
 	async #showOverlay(): Promise<AppliedOperation> {
 		const id = this.#nextOverlayId;
 		this.#nextOverlayId += 1;
-		const model = new StressOverlayModel(this.#rng, id);
+		const model = new StressOverlayModel(this.#streams.overlay, id);
 		const component = new StressOverlayComponent(model);
 		const { options, detail } = this.#randomOverlayOptions();
 		const handle = this.#tui.showOverlay(component, options);
@@ -1362,7 +1655,7 @@ class StressDriver {
 			detail,
 		};
 		this.#overlays.push(entry);
-		await settle(this.#term);
+		await this.#settle();
 		return this.#viewOperation("showOverlay", {
 			id,
 			sentinel: model.sentinel,
@@ -1377,7 +1670,7 @@ class StressDriver {
 		entry.handle.hide();
 		this.#overlays = this.#overlays.filter(overlay => overlay !== entry);
 		this.#hiddenOverlaySentinels.add(entry.sentinel);
-		await settle(this.#term);
+		await this.#settle();
 		return this.#viewOperation("hideOverlay", { id: entry.id, sentinel: entry.sentinel });
 	}
 
@@ -1387,7 +1680,7 @@ class StressDriver {
 		entry.hidden = !entry.hidden;
 		entry.handle.setHidden(entry.hidden);
 		if (entry.hidden) this.#hiddenOverlaySentinels.add(entry.sentinel);
-		await settle(this.#term);
+		await this.#settle();
 		return this.#viewOperation("toggleOverlayHidden", {
 			id: entry.id,
 			sentinel: entry.sentinel,
@@ -1400,7 +1693,7 @@ class StressDriver {
 		if (entry === undefined) return this.#viewOperation("editOverlay", { skipped: true });
 		const detail = entry.model.mutate(this.#term.columns);
 		this.#tui.requestRender(false, { allowUnknownViewportMutation: true });
-		await settle(this.#term);
+		await this.#settle();
 		return this.#viewOperation("editOverlay", { id: entry.id, detail });
 	}
 
@@ -1410,68 +1703,69 @@ class StressDriver {
 		const cursor = entry.model.setCursor(this.#term.columns);
 		this.#tui.setFocus(entry.component);
 		this.#tui.requestRender(false, { allowUnknownViewportMutation: true });
-		await settle(this.#term);
+		await this.#settle();
 		return this.#viewOperation("moveOverlayCursor", { id: entry.id, cursor });
 	}
 
 	#pickOverlay(): StressOverlayEntry | undefined {
 		if (this.#overlays.length === 0) return undefined;
-		return this.#overlays[this.#rng.int(0, this.#overlays.length - 1)];
+		return this.#overlays[this.#streams.overlay.int(0, this.#overlays.length - 1)];
 	}
 
 	#randomOverlayOptions(): { options: OverlayOptions; detail: JsonObject } {
+		const rng = this.#streams.overlay;
 		const options: OverlayOptions = {};
 		const detail: JsonObject = {};
-		if (this.#rng.chance(0.75)) {
-			const width = this.#rng.chance(0.35)
-				? (`${this.#rng.pick([25, 40, 60, 80])}%` as `${number}%`)
-				: this.#rng.int(1, Math.max(1, this.#term.columns + 8));
+		if (rng.chance(0.75)) {
+			const width = rng.chance(0.35)
+				? (`${rng.pick([25, 40, 60, 80])}%` as `${number}%`)
+				: rng.int(1, Math.max(1, this.#term.columns + 8));
 			options.width = width;
 			detail.width = width;
 		}
-		if (this.#rng.chance(0.35)) {
-			const maxHeight = this.#rng.chance(0.35)
-				? (`${this.#rng.pick([25, 50, 75])}%` as `${number}%`)
-				: this.#rng.int(1, Math.max(1, this.#term.rows));
+		if (rng.chance(0.35)) {
+			const maxHeight = rng.chance(0.35)
+				? (`${rng.pick([25, 50, 75])}%` as `${number}%`)
+				: rng.int(1, Math.max(1, this.#term.rows));
 			options.maxHeight = maxHeight;
 			detail.maxHeight = maxHeight;
 		}
-		if (this.#rng.chance(0.25)) {
-			const minWidth = this.#rng.int(1, Math.max(1, this.#term.columns + 4));
+		if (rng.chance(0.25)) {
+			const minWidth = rng.int(1, Math.max(1, this.#term.columns + 4));
 			options.minWidth = minWidth;
 			detail.minWidth = minWidth;
 		}
-		if (this.#rng.chance(0.5)) {
-			const anchor = this.#rng.pick(OVERLAY_ANCHORS);
+		if (rng.chance(0.5)) {
+			const anchor = rng.pick(OVERLAY_ANCHORS);
 			options.anchor = anchor;
-			options.offsetX = this.#rng.int(-3, 3);
-			options.offsetY = this.#rng.int(-2, 2);
+			options.offsetX = rng.int(-3, 3);
+			options.offsetY = rng.int(-2, 2);
 			detail.anchor = anchor;
 			detail.offsetX = options.offsetX;
 			detail.offsetY = options.offsetY;
 		} else {
-			const row = this.#rng.chance(0.45)
-				? (`${this.#rng.pick([0, 25, 50, 75, 100])}%` as `${number}%`)
-				: this.#rng.int(-2, this.#term.rows + 2);
-			const col = this.#rng.chance(0.45)
-				? (`${this.#rng.pick([0, 25, 50, 75, 100])}%` as `${number}%`)
-				: this.#rng.int(-4, this.#term.columns + 4);
+			const row = rng.chance(0.45)
+				? (`${rng.pick([0, 25, 50, 75, 100])}%` as `${number}%`)
+				: rng.int(-2, this.#term.rows + 2);
+			const col = rng.chance(0.45)
+				? (`${rng.pick([0, 25, 50, 75, 100])}%` as `${number}%`)
+				: rng.int(-4, this.#term.columns + 4);
 			options.row = row;
 			options.col = col;
 			detail.row = row;
 			detail.col = col;
 		}
-		if (this.#rng.chance(0.6)) {
-			if (this.#rng.chance(0.5)) {
-				const margin = this.#rng.int(0, 2);
+		if (rng.chance(0.6)) {
+			if (rng.chance(0.5)) {
+				const margin = rng.int(0, 2);
 				options.margin = margin;
 				detail.margin = margin;
 			} else {
 				const margin = {
-					top: this.#rng.int(0, 2),
-					right: this.#rng.int(0, 2),
-					bottom: this.#rng.int(0, 2),
-					left: this.#rng.int(0, 2),
+					top: rng.int(0, 2),
+					right: rng.int(0, 2),
+					bottom: rng.int(0, 2),
+					left: rng.int(0, 2),
 				};
 				options.margin = margin;
 				detail.margin = margin;
@@ -1484,41 +1778,26 @@ class StressDriver {
 		const columns = this.#pickDifferent(this.#scenario.widthChoices, this.#term.columns);
 		const rows = this.#pickDifferent(this.#scenario.heightChoices, this.#term.rows);
 		this.#term.resize(columns, rows);
-		if (!this.#scenario.strictScrollback) {
+		// foregroundStream models a live tool turn: let the terminal's own resize
+		// callback drive the (non-forced, gated) repaint the real app relies on,
+		// rather than forcing an allowUnknown rebuild the streaming path never uses.
+		if (!this.#traits.strictNativeScrollback && !this.#traits.foregroundStreaming) {
 			this.#tui.requestRender(true, { allowUnknownViewportMutation: true });
 		}
-		await settle(this.#term);
-		return {
-			kind: "resizeBoth",
-			detail: { columns, rows },
-			mutatesContent: false,
-			checksRowAccounting: false,
-			geometryChanged: true,
-			forcedRender: false,
-			mutatesViewport: true,
-			checkpoint: false,
-		};
+		await this.#settle();
+		return viewOperation("resizeBoth", { columns, rows }, { geometryChanged: true, mutatesViewport: true });
 	}
 
 	async #resizeNoop(): Promise<AppliedOperation> {
 		this.#term.resize(this.#term.columns, this.#term.rows);
-		await settle(this.#term);
-		return {
-			kind: "resizeNoop",
-			detail: { columns: this.#term.columns, rows: this.#term.rows },
-			mutatesContent: false,
-			checksRowAccounting: false,
-			geometryChanged: false,
-			forcedRender: false,
-			mutatesViewport: false,
-			checkpoint: false,
-		};
+		await this.#settle();
+		return viewOperation("resizeNoop", { columns: this.#term.columns, rows: this.#term.rows });
 	}
 
 	async #scrollUp(): Promise<AppliedOperation> {
-		const amount = this.#rng.int(1, Math.max(1, this.#term.rows * 2));
+		const amount = this.#streams.geometry.int(1, Math.max(1, this.#term.rows * 2));
 		this.#term.scrollLines(-amount);
-		await settle(this.#term);
+		await this.#settle();
 		return this.#viewOperation("scrollUp", { amount });
 	}
 
@@ -1526,64 +1805,41 @@ class StressDriver {
 		this.#term.scrollLines(LARGE_SCROLL);
 		this.#tui.requestRender(true, {
 			allowUnknownViewportMutation: true,
-			clearScrollback: this.#scenario.strictScrollback,
+			clearScrollback: this.#traits.strictNativeScrollback,
 		});
-		await settle(this.#term);
-		return {
-			kind: "scrollToBottom",
-			detail: { forcedCheckpoint: this.#scenario.strictScrollback },
-			mutatesContent: false,
-			checksRowAccounting: false,
-			geometryChanged: false,
-			forcedRender: true,
-			mutatesViewport: true,
-			checkpoint: true,
-		};
+		await this.#settle();
+		return forceRenderOperation(
+			"scrollToBottom",
+			{ forcedCheckpoint: this.#traits.strictNativeScrollback },
+			{ checkpoint: true, mutatesViewport: true },
+		);
 	}
 
 	async #scrollPartial(): Promise<AppliedOperation> {
-		const amount = this.#rng.int(1, Math.max(1, this.#term.rows));
-		const direction = this.#rng.chance(0.5) ? -1 : 1;
+		const amount = this.#streams.geometry.int(1, Math.max(1, this.#term.rows));
+		const direction = this.#streams.geometry.chance(0.5) ? -1 : 1;
 		this.#term.scrollLines(direction * amount);
-		await settle(this.#term);
+		await this.#settle();
 		return this.#viewOperation("scrollPartial", { amount: direction * amount });
 	}
 	async #resizeWidth(): Promise<AppliedOperation> {
 		const columns = this.#pickDifferent(this.#scenario.widthChoices, this.#term.columns);
 		this.#term.resize(columns, this.#term.rows);
-		if (!this.#scenario.strictScrollback) {
+		if (!this.#traits.strictNativeScrollback && !this.#traits.foregroundStreaming) {
 			this.#tui.requestRender(true, { allowUnknownViewportMutation: true });
 		}
-		await settle(this.#term);
-		return {
-			kind: "resizeWidth",
-			detail: { columns },
-			mutatesContent: false,
-			checksRowAccounting: false,
-			geometryChanged: true,
-			forcedRender: false,
-			mutatesViewport: true,
-			checkpoint: false,
-		};
+		await this.#settle();
+		return viewOperation("resizeWidth", { columns }, { geometryChanged: true, mutatesViewport: true });
 	}
 
 	async #resizeHeight(): Promise<AppliedOperation> {
 		const rows = this.#pickDifferent(this.#scenario.heightChoices, this.#term.rows);
 		this.#term.resize(this.#term.columns, rows);
-		if (!this.#scenario.strictScrollback) {
+		if (!this.#traits.strictNativeScrollback && !this.#traits.foregroundStreaming) {
 			this.#tui.requestRender(true, { allowUnknownViewportMutation: true });
 		}
-		await settle(this.#term);
-		return {
-			kind: "resizeHeight",
-			detail: { rows },
-			mutatesContent: false,
-			checksRowAccounting: false,
-			geometryChanged: true,
-			forcedRender: false,
-			mutatesViewport: true,
-			checkpoint: false,
-		};
+		await this.#settle();
+		return viewOperation("resizeHeight", { rows }, { geometryChanged: true, mutatesViewport: true });
 	}
 
 	// SIGWINCH racing a streamed token: the model grows and the terminal
@@ -1594,39 +1850,33 @@ class StressDriver {
 	async #resizeWithAppend(): Promise<AppliedOperation> {
 		const appended = this.#model.appendSmall();
 		const rows = this.#pickDifferent(this.#scenario.heightChoices, this.#term.rows);
-		const columns = this.#rng.chance(0.5)
+		const columns = this.#streams.geometry.chance(0.5)
 			? this.#pickDifferent(this.#scenario.widthChoices, this.#term.columns)
 			: this.#term.columns;
 		this.#term.resize(columns, rows);
-		await settle(this.#term);
-		return {
-			kind: "resizeWithAppend",
-			detail: { appended, columns, rows },
-			mutatesContent: true,
-			checksRowAccounting: false,
+		await this.#settle();
+		return contentOperation("resizeWithAppend", { appended, columns, rows }, false, {
 			geometryChanged: true,
-			forcedRender: false,
 			mutatesViewport: true,
-			checkpoint: false,
-		};
+		});
 	}
 
 	async #forceRender(): Promise<AppliedOperation> {
 		this.#tui.requestRender(true);
-		await settle(this.#term);
+		await this.#settle();
 		return this.#forceOperation("forceRender", {});
 	}
 
 	async #forceRenderAllowUnknown(): Promise<AppliedOperation> {
 		this.#tui.requestRender(true, { allowUnknownViewportMutation: true });
-		await settle(this.#term);
+		await this.#settle();
 		return this.#forceOperation("forceRenderAllowUnknown", { allowUnknownViewportMutation: true });
 	}
 
 	async #forceRenderClearScrollback(): Promise<AppliedOperation> {
 		this.#term.scrollLines(LARGE_SCROLL);
 		this.#tui.requestRender(true, { allowUnknownViewportMutation: true, clearScrollback: true });
-		await settle(this.#term);
+		await this.#settle();
 		return { ...this.#forceOperation("forceRenderClearScrollback", { clearScrollback: true }), checkpoint: true };
 	}
 
@@ -1640,15 +1890,15 @@ class StressDriver {
 		}
 		const empty = this.#model.clear();
 		this.#tui.requestRender(true, { allowUnknownViewportMutation: true, clearScrollback: true });
-		await settle(this.#term);
+		await this.#settle();
 		// The clear's own replay frame can itself overflow the viewport (status
 		// header + residual rows), so the transient bound must cover everything
 		// this op writes: the cleared frame plus the fresh overflow appends.
 		const clearedFrameLength = this.#expectedFrame().frame.length;
-		const overflowCount = this.#term.rows + this.#rng.int(1, 4);
+		const overflowCount = this.#term.rows + this.#streams.geometry.int(1, 4);
 		const overflow = this.#model.appendCount(overflowCount, "overflow");
 		this.#tui.requestRender(true, { allowUnknownViewportMutation: true });
-		await settle(this.#term);
+		await this.#settle();
 		return {
 			...this.#forceOperation("forceRenderAfterEmptyOverflow", { detachedChildren, empty, overflow }),
 			mutatesContent: true,
@@ -1659,16 +1909,9 @@ class StressDriver {
 	}
 
 	#forceOperation(kind: OperationKind, detail: JsonObject): AppliedOperation {
-		return {
-			kind,
-			detail,
-			mutatesContent: false,
-			checksRowAccounting: false,
-			geometryChanged: false,
-			forcedRender: true,
+		return forceRenderOperation(kind, detail, {
 			mutatesViewport: kind === "forceRenderClearScrollback" || kind === "forceRenderAfterEmptyOverflow",
-			checkpoint: false,
-		};
+		});
 	}
 
 	async #toggleFocusInput(): Promise<AppliedOperation> {
@@ -1676,23 +1919,14 @@ class StressDriver {
 		if (this.#component.focused) {
 			this.#tui.setFocus(null);
 		} else {
-			cursor = this.#rng.chance(0.25)
+			cursor = this.#streams.cursor.chance(0.25)
 				? this.#model.setCursorOffscreen(this.#term.rows, this.#term.columns)
 				: this.#model.setCursorVisible(this.#term.rows, this.#term.columns);
 			this.#tui.setFocus(this.#component);
 		}
 		this.#tui.requestRender(false, { allowUnknownViewportMutation: true });
-		await settle(this.#term);
-		return {
-			kind: "toggleFocusInput",
-			detail: { focused: this.#component.focused, cursor },
-			mutatesContent: false,
-			checksRowAccounting: false,
-			geometryChanged: false,
-			forcedRender: false,
-			mutatesViewport: false,
-			checkpoint: false,
-		};
+		await this.#settle();
+		return viewOperation("toggleFocusInput", { focused: this.#component.focused, cursor });
 	}
 
 	// Container.addChild appends and Container.render walks children in array
@@ -1716,37 +1950,19 @@ class StressDriver {
 		child.active = true;
 		this.#syncChildOrder();
 		this.#renderContentFrame();
-		await settle(this.#term);
-		return {
-			kind: "attachChild",
-			detail: { id: child.id, lines: child.model.debugLines() },
-			mutatesContent: true,
-			checksRowAccounting: false,
-			geometryChanged: false,
-			forcedRender: false,
-			mutatesViewport: false,
-			checkpoint: false,
-		};
+		await this.#settle();
+		return contentOperation("attachChild", { id: child.id, lines: child.model.debugLines() }, false);
 	}
 
 	async #detachChild(): Promise<AppliedOperation> {
 		const active = this.#children.filter(entry => entry.active);
-		const child = active.length === 0 ? undefined : active[this.#rng.int(0, active.length - 1)];
+		const child = active.length === 0 ? undefined : active[this.#streams.children.int(0, active.length - 1)];
 		if (child === undefined) return this.#viewOperation("detachChild", { skipped: true });
 		child.active = false;
 		this.#tui.removeChild(child.component);
 		this.#renderContentFrame();
-		await settle(this.#term);
-		return {
-			kind: "detachChild",
-			detail: { id: child.id },
-			mutatesContent: true,
-			checksRowAccounting: false,
-			geometryChanged: false,
-			forcedRender: false,
-			mutatesViewport: false,
-			checkpoint: false,
-		};
+		await this.#settle();
+		return contentOperation("detachChild", { id: child.id }, false);
 	}
 
 	async #reorderChildren(): Promise<AppliedOperation> {
@@ -1756,66 +1972,60 @@ class StressDriver {
 		if (first !== undefined) this.#children.push(first);
 		this.#syncChildOrder();
 		this.#renderContentFrame();
-		await settle(this.#term);
-		return {
-			kind: "reorderChildren",
-			detail: { activeOrder: this.#children.filter(child => child.active).map(child => child.id) },
-			mutatesContent: true,
-			checksRowAccounting: false,
-			geometryChanged: false,
-			forcedRender: false,
-			mutatesViewport: false,
-			checkpoint: false,
-		};
+		await this.#settle();
+		return contentOperation(
+			"reorderChildren",
+			{ activeOrder: this.#children.filter(child => child.active).map(child => child.id) },
+			false,
+		);
 	}
 
 	async #mutateChild(): Promise<AppliedOperation> {
 		const active = this.#children.filter(entry => entry.active);
-		const child = active.length === 0 ? undefined : active[this.#rng.int(0, active.length - 1)];
+		const child = active.length === 0 ? undefined : active[this.#streams.children.int(0, active.length - 1)];
 		if (child === undefined) return this.#viewOperation("mutateChild", { skipped: true });
-		const detail = this.#rng.chance(0.5) ? child.model.appendSmall() : child.model.editVisibleLine(this.#term.rows);
+		const detail = this.#streams.children.chance(0.5)
+			? child.model.appendSmall()
+			: child.model.editVisibleLine(this.#term.rows);
 		this.#renderContentFrame();
-		await settle(this.#term);
-		return {
-			kind: "mutateChild",
-			detail: { id: child.id, detail },
-			mutatesContent: true,
-			checksRowAccounting: false,
-			geometryChanged: false,
-			forcedRender: false,
-			mutatesViewport: false,
-			checkpoint: false,
-		};
+		await this.#settle();
+		return contentOperation("mutateChild", { id: child.id, detail }, false);
 	}
 
 	#viewOperation(kind: OperationKind, detail: JsonObject): AppliedOperation {
-		return {
-			kind,
-			detail,
-			mutatesContent: false,
-			checksRowAccounting: false,
-			geometryChanged: false,
-			forcedRender: false,
+		return viewOperation(kind, detail, {
 			mutatesViewport: kind === "scrollUp" || kind === "scrollPartial",
-			checkpoint: false,
-		};
+		});
 	}
 
 	#pickDifferent(values: readonly number[], current: number): number {
 		const candidates = values.filter(value => value !== current);
-		return candidates.length === 0 ? current : this.#rng.pick(candidates);
+		return candidates.length === 0 ? current : this.#streams.geometry.pick(candidates);
 	}
 
 	async #checkpoint(index: number, kind: "periodicCheckpoint"): Promise<void> {
 		const before = this.#snapshot();
+		// Model a prompt submit: the editor keystroke pins the terminal to the
+		// bottom, then the app reconciles any deferred native-scrollback rewrite.
 		this.#term.scrollLines(LARGE_SCROLL);
-		this.#tui.requestRender(true, {
-			allowUnknownViewportMutation: true,
-			clearScrollback: this.#scenario.strictScrollback,
-		});
-		await settle(this.#term);
+		if (this.#traits.strictNativeScrollback || this.#traits.preservesPaneHistory) {
+			// Normal POSIX uses a /clear-style forced rebuild; tmux keeps its forced
+			// repaint (its pane history cannot be destructively reconciled).
+			this.#tui.requestRender(true, {
+				allowUnknownViewportMutation: true,
+				clearScrollback: this.#traits.strictNativeScrollback,
+			});
+		} else {
+			// Unknown-viewport / ED3-risk / Windows hosts take the real prompt-submit
+			// path: refreshNativeScrollbackIfDirty rebuilds the deferred history now
+			// that the keystroke has pinned the viewport to the bottom. This is where
+			// the streaming turn's dirty/lagged scrollback must reconcile to an exact
+			// copy of the transcript.
+			this.#tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true });
+		}
+		await this.#settle();
 		const after = this.#snapshot();
-		this.#recordOperation(index, kind, { forcedCheckpoint: this.#scenario.strictScrollback }, before, after);
+		this.#recordOperation(index, kind, { forcedCheckpoint: this.#traits.strictNativeScrollback }, before, after);
 		this.#assertOracles(
 			{
 				kind: "scrollToBottom",
@@ -1826,6 +2036,7 @@ class StressDriver {
 				forcedRender: true,
 				mutatesViewport: true,
 				checkpoint: true,
+				reconcilesNativeScrollback: true,
 			},
 			before,
 			after,
@@ -1835,11 +2046,12 @@ class StressDriver {
 
 	#recordOperation(
 		index: number,
-		kind: OperationKind | "periodicCheckpoint",
+		kind: OperationLogKind,
 		detail: JsonObject,
 		before: Snapshot,
 		after: Snapshot,
 	): void {
+		this.#operationCoverage.set(kind, (this.#operationCoverage.get(kind) ?? 0) + 1);
 		this.#opLog.push({
 			index,
 			kind,
@@ -1871,7 +2083,16 @@ class StressDriver {
 		this.#assertNoStaleOverlaySentinels(op, before, after, index);
 		this.#assertUniqueContentNoUnexpectedDuplicates(op, before, after, index);
 		this.#assertNoBackgroundBleed(op, before, after, index);
-		if (op.checkpoint && this.#scenario.strictScrollback) {
+		// Native scrollback must reconcile to an exact bottom-anchored copy of the
+		// transcript at every checkpoint — including the unknown-viewport / ED3-risk
+		// / Windows hosts whose live oracles are relaxed (they defer history rewrites
+		// mid-stream and only reconcile here). tmux is excluded: its pane history is
+		// preserved, not rebuilt, so the buffer snapshot is the view, not history.
+		if (
+			op.checkpoint &&
+			!this.#traits.preservesPaneHistory &&
+			(this.#traits.strictNativeScrollback || op.reconcilesNativeScrollback === true)
+		) {
 			this.#assertCleanBuffer(op, before, after, index);
 		}
 	}
@@ -1890,37 +2111,12 @@ class StressDriver {
 	// the invariant. Audits incrementally from #writeLogScanned to stay O(bytes).
 	#assertSyncOutputDiscipline(op: AppliedOperation, before: Snapshot, after: Snapshot, index: number): void {
 		for (; this.#writeLogScanned < this.#writeLog.length; this.#writeLogScanned++) {
-			const chunk = this.#writeLog[this.#writeLogScanned]!;
-			let cursor = 0;
-			while (cursor < chunk.length) {
-				const esc = chunk.indexOf("\x1b[?", cursor);
-				if (esc === -1) break;
-				if (chunk.startsWith("\x1b[?2026h", esc)) {
-					this.#syncDepth++;
-					if (this.#syncDepth > 1) {
-						this.#fail("nested synchronized-output begin (BSU within BSU)", op, before, after, index, {
-							syncDepth: this.#syncDepth,
-						});
-					}
-					cursor = esc + 8;
-				} else if (chunk.startsWith("\x1b[?2026l", esc)) {
-					this.#syncDepth--;
-					if (this.#syncDepth < 0) {
-						this.#fail("synchronized-output end (ESU) without matching begin", op, before, after, index, {
-							syncDepth: this.#syncDepth,
-						});
-					}
-					cursor = esc + 8;
-				} else if (chunk.startsWith("\x1b[?7l", esc)) {
-					this.#autowrapOffDepth++;
-					cursor = esc + 5;
-				} else if (chunk.startsWith("\x1b[?7h", esc)) {
-					this.#autowrapOffDepth--;
-					cursor = esc + 5;
-				} else {
-					cursor = esc + 3;
-				}
-			}
+			this.#consumeAnsiChunk(this.#writeLog[this.#writeLogScanned]!, op, before, after, index);
+		}
+		if (this.#ansiCarry.length > 0) {
+			this.#fail("incomplete private CSI sequence at op boundary", op, before, after, index, {
+				carry: this.#ansiCarry,
+			});
 		}
 		// At an op boundary every paint/cursor write the op emitted has completed,
 		// so both brackets must be balanced. A nonzero depth means a paint path
@@ -1937,15 +2133,83 @@ class StressDriver {
 		}
 	}
 
-	// SGR/BCE bleed: background attributes must appear only on viewport rows
+	#consumeAnsiChunk(data: string, op: AppliedOperation, before: Snapshot, after: Snapshot, index: number): void {
+		const input = this.#ansiCarry + data;
+		this.#ansiCarry = "";
+		let cursor = 0;
+		while (cursor < input.length) {
+			const esc = input.indexOf("\x1b[?", cursor);
+			if (esc === -1) break;
+			const terminator = findPrivateCsiTerminator(input, esc + 3);
+			if (terminator === -1) {
+				this.#ansiCarry = input.slice(esc);
+				return;
+			}
+			const final = input[terminator] ?? "";
+			if (final === "h" || final === "l") {
+				const params = parseCsiParameters(input.slice(esc + 3, terminator));
+				this.#consumePrivateModeSequence(params, final, op, before, after, index);
+			}
+			cursor = terminator + 1;
+		}
+		const carryStart = trailingPrivateCsiPrefixStart(input);
+		if (carryStart >= 0) {
+			this.#ansiCarry = input.slice(carryStart);
+		}
+	}
+
+	#consumePrivateModeSequence(
+		params: readonly number[],
+		final: "h" | "l",
+		op: AppliedOperation,
+		before: Snapshot,
+		after: Snapshot,
+		index: number,
+	): void {
+		if (params.includes(2026)) {
+			if (this.#traits.syncOutputDisabled) {
+				this.#fail(
+					final === "h"
+						? "synchronized-output begin emitted while PI_NO_SYNC_OUTPUT is set"
+						: "synchronized-output end emitted while PI_NO_SYNC_OUTPUT is set",
+					op,
+					before,
+					after,
+					index,
+					{ sequence: final === "h" ? "BSU" : "ESU" },
+				);
+			}
+			this.#syncDepth += final === "h" ? 1 : -1;
+			if (this.#syncDepth > 1) {
+				this.#fail("nested synchronized-output begin (BSU within BSU)", op, before, after, index, {
+					syncDepth: this.#syncDepth,
+				});
+			}
+			if (this.#syncDepth < 0) {
+				this.#fail("synchronized-output end (ESU) without matching begin", op, before, after, index, {
+					syncDepth: this.#syncDepth,
+				});
+			}
+		}
+		if (params.includes(7)) {
+			this.#autowrapOffDepth += final === "l" ? 1 : -1;
+			if (this.#autowrapOffDepth < 0) {
+				this.#fail("autowrap enabled without matching disable", op, before, after, index, {
+					autowrapOffDepth: this.#autowrapOffDepth,
+				});
+			}
+		}
+	}
+
+	// SGR/BCE bleed: background attributes must appear only on viewport cells
 	// whose logical content carries background SGR. Stress content includes
 	// deliberately unreset background sequences (backgroundStyledText); the
 	// renderer's per-line terminators (#applyLineResets / LINE_TERMINATOR) must
-	// confine the color to its own row. A leak means BCE (back-color-erase, which
-	// xterm.js and most real terminals implement) paints \x1b[K / \x1b[2K erased
-	// cells with the stale background — the user-visible "random colored blank
-	// rows" bug class. Text-only oracles cannot see this; this oracle reads cell
-	// attributes.
+	// confine the color to its own text cells. A leak means BCE (back-color-erase,
+	// which xterm.js and most real terminals implement) paints \x1b[K / \x1b[2K
+	// erased cells with the stale background — the user-visible "random colored
+	// blank cells" bug class. Text-only oracles cannot see this; this oracle reads
+	// cell attributes.
 	#assertNoBackgroundBleed(op: AppliedOperation, before: Snapshot, after: Snapshot, index: number): void {
 		if (this.#hasVisibleOverlay()) return;
 		if (!after.atBottom) return;
@@ -1961,13 +2225,17 @@ class StressDriver {
 			// legitimately blank row.
 			if ((after.view[row] ?? "") !== (expectedView[row] ?? "")) continue;
 			const frameRow = viewportTop + row;
-			if (after.frameBackgroundRows[frameRow] !== true) {
+			const expectedColumns = new Set(after.frameBackgroundColumns[frameRow] ?? []);
+			const unexpectedColumns = backgroundColumns.filter(column => !expectedColumns.has(column));
+			if (unexpectedColumns.length > 0) {
 				this.#fail("background SGR bleed", op, before, after, index, {
 					row,
 					frameRow,
 					backgroundColumns,
+					unexpectedColumns,
+					expectedColumns: [...expectedColumns],
 					rowText: after.view[row] ?? null,
-					expected: "background-colored cells only on rows whose content carries background SGR",
+					expected: "background-colored cells only on columns whose content carries background SGR",
 				});
 			}
 		}
@@ -1983,11 +2251,26 @@ class StressDriver {
 		// visible window at the new geometry (any output anchored to pre-reflow
 		// rows splices phantom rows into the pane). Geometry repaints write every
 		// row, so ghost trailing blanks cannot occur and the comparison is exact.
-		if (this.#scenario.envMode === "tmux") {
+		if (this.#traits.preservesPaneHistory) {
 			if (!op.geometryChanged) return;
 			const expectedAfterResize = expectedViewport(after.frame, after.height);
 			if (!sameLines(after.view, expectedAfterResize)) {
 				this.#fail("viewport fidelity", op, before, after, index, { expected: expectedAfterResize });
+			}
+			return;
+		}
+		// Foreground-tool streaming never legitimately defers: the eager opt-in keeps
+		// the live tail current every frame (a shrink repaints in place rather than
+		// padding and pinning the pre-shrink viewport), so the visible window must be
+		// exactly bottom-anchored even when stale rows still sit in native scrollback
+		// (those reconcile at the next checkpoint). Asserting the visible rows
+		// directly — without the ghost-row buffer-length bail below — is what catches
+		// the "injected chip rendered over the tool render" drift head-on instead of
+		// skipping the frame because the drift left a length mismatch.
+		if (this.#traits.foregroundStreaming) {
+			const expected = expectedViewport(after.frame, after.height);
+			if (!sameLines(after.view, expected)) {
+				this.#fail("foreground-stream viewport fidelity", op, before, after, index, { expected });
 			}
 			return;
 		}
@@ -2004,7 +2287,7 @@ class StressDriver {
 	}
 
 	#assertCleanBufferWhenAligned(op: AppliedOperation, before: Snapshot, after: Snapshot, index: number): void {
-		if (!this.#scenario.strictScrollback || !after.atBottom || op.geometryChanged) return;
+		if (!this.#traits.strictNativeScrollback || !after.atBottom || op.geometryChanged) return;
 		if (this.#hasVisibleOverlay()) return;
 		if (!this.#bufferReflectsFrame(before.buffer, before.frame, before.height)) return;
 		const expected = this.#expectedScrollbackBuffer(after);
@@ -2019,7 +2302,7 @@ class StressDriver {
 
 	#assertNoFrameNeutralScrollbackGrowth(op: AppliedOperation, before: Snapshot, after: Snapshot, index: number): void {
 		if (this.#hasVisibleOverlay()) return;
-		if (!this.#scenario.strictScrollback || op.checkpoint || op.geometryChanged) return;
+		if (!this.#traits.strictNativeScrollback || op.checkpoint || op.geometryChanged) return;
 		if (!before.atBottom || !after.atBottom) return;
 		if (!sameLines(before.frame, after.frame)) return;
 		if (after.buffer.length > before.buffer.length) {
@@ -2065,9 +2348,9 @@ class StressDriver {
 		if (!op.mutatesContent || before.atBottom) return;
 		if (op.mutatesViewport || op.geometryChanged || op.checkpoint) return;
 		if (
-			this.#scenario.terminalMode !== "normal" &&
-			this.#scenario.platform !== "win32" &&
-			!this.#isUnknownEd3RiskScenario()
+			this.#traits.viewportProbe !== "known" &&
+			!this.#traits.conptyHostScrollbackUnobservable &&
+			!this.#traits.ed3ScrollbackEraseRisk
 		)
 			return;
 		if (after.position.viewportY !== before.position.viewportY) {
@@ -2097,7 +2380,7 @@ class StressDriver {
 	}
 
 	#assertRowAccounting(op: AppliedOperation, before: Snapshot, after: Snapshot, index: number): void {
-		if (!this.#scenario.strictScrollback || this.#hasVisibleOverlay()) return;
+		if (!this.#traits.strictNativeScrollback || this.#hasVisibleOverlay()) return;
 		if (!op.mutatesContent || !op.checksRowAccounting || op.geometryChanged || op.forcedRender) return;
 		if (!before.atBottom || !after.atBottom) return;
 		if (this.#scrollbackCapReached(before) || this.#scrollbackCapReached(after)) return;
@@ -2128,7 +2411,7 @@ class StressDriver {
 		after: Snapshot,
 		index: number,
 	): void {
-		if (!this.#scenario.strictScrollback || this.#hasVisibleOverlay()) return;
+		if (!this.#traits.strictNativeScrollback || this.#hasVisibleOverlay()) return;
 		if (op.checkpoint || op.geometryChanged) return;
 		if (!before.atBottom || !after.atBottom) return;
 		const deltaBuffer = after.buffer.length - before.buffer.length;
@@ -2168,7 +2451,7 @@ class StressDriver {
 	// pane history and a height grow moves rows back out — width changes rewrap
 	// pane history with unbounded row deltas and cannot be bounded from here.
 	#assertMultiplexerPaneHistoryGrowth(op: AppliedOperation, before: Snapshot, after: Snapshot, index: number): void {
-		if (this.#scenario.envMode !== "tmux") return;
+		if (!this.#traits.preservesPaneHistory) return;
 		if (op.checkpoint) return;
 		const heightOnlyResize = op.kind === "resizeHeight";
 		if (op.geometryChanged && !heightOnlyResize) return;
@@ -2194,7 +2477,7 @@ class StressDriver {
 	}
 
 	#assertHistoryPrefixStability(op: AppliedOperation, before: Snapshot, after: Snapshot, index: number): void {
-		if (!this.#scenario.strictScrollback) return;
+		if (!this.#traits.strictNativeScrollback) return;
 		if (this.#scrollbackCapReached(before) || this.#scrollbackCapReached(after)) return;
 		if (!op.mutatesContent || before.redraws !== after.redraws) return;
 		const prefixLength = Math.max(0, Math.min(before.position.viewportY, before.buffer.length));
@@ -2210,7 +2493,7 @@ class StressDriver {
 	}
 
 	#assertNativeScrollbackReplay(op: AppliedOperation, before: Snapshot, after: Snapshot, index: number): void {
-		if (!this.#scenario.strictScrollback) return;
+		if (!this.#traits.strictNativeScrollback) return;
 		if (op.geometryChanged) {
 			this.#nativeScrollbackAuditBlocked = true;
 			return;
@@ -2288,11 +2571,10 @@ class StressDriver {
 		// Multiplexers preserve pane history and do not allow the renderer to scrub
 		// scrollback safely. A hidden overlay must disappear from the live viewport,
 		// but the viewport can itself be parked in pane history while scrolled.
-		if (this.#scenario.envMode === "tmux" && !after.atBottom) return;
-		const nativeText =
-			this.#scenario.envMode === "tmux"
-				? after.view.join("\n")
-				: `${after.buffer.join("\n")}\n${after.view.join("\n")}`;
+		if (this.#traits.preservesPaneHistory && !after.atBottom) return;
+		const nativeText = this.#traits.preservesPaneHistory
+			? after.view.join("\n")
+			: `${after.buffer.join("\n")}\n${after.view.join("\n")}`;
 		for (const sentinel of this.#hiddenOverlaySentinels) {
 			if (visibleSentinels.has(sentinel)) continue;
 			if (nativeText.includes(sentinel)) {
@@ -2334,17 +2616,47 @@ class StressDriver {
 		index: number,
 		extra: JsonObject,
 	): never {
+		const replayLogPath = writeReplayLog(this.#scenario, this.#opLog);
+		const replay = `TUI_STRESS_REPLAY=${JSON.stringify({
+			scenario: this.#scenario.name,
+			seed: formatSeed(this.#scenario.seed),
+			iterations: index + 1,
+		})}`;
+		const replayLog = `TUI_STRESS_REPLAY_LOG=${replayLogPath}`;
+		const fullDump = Bun.env.TUI_STRESS_FULL_DUMP === "1";
 		const dump = {
 			message,
 			scenario: this.#scenario.name,
 			seed: formatSeed(this.#scenario.seed),
 			opIndex: index,
+			replay,
+			replayLog,
+			replayLogPath,
 			op: { kind: op.kind, detail: op.detail },
 			extra,
-			before: snapshotDump(before),
-			after: snapshotDump(after),
-			model: this.#model.debugLines(),
-			opLog: this.#opLog,
+			traits: this.#traits,
+			tags: this.#scenario.tags,
+			operationCoverage: Object.fromEntries(this.#operationCoverage.entries()),
+			lastOperations: this.#opLog.slice(-50),
+			children: this.#children.map(child => ({
+				id: child.id,
+				active: child.active,
+				focused: child.component.focused,
+				lines: child.model.debugLines(),
+			})),
+			overlays: this.#overlays.map(overlay => ({
+				id: overlay.id,
+				hidden: overlay.hidden,
+				focused: overlay.component.focused,
+				sentinel: overlay.sentinel,
+				options: overlay.detail,
+				lines: overlay.model.debugLines(),
+			})),
+			before: fullDump ? snapshotDump(before) : snapshotSummary(before),
+			after: fullDump ? snapshotDump(after) : snapshotSummary(after),
+			model: fullDump ? this.#model.debugLines() : undefined,
+			opLog: fullDump ? this.#opLog : undefined,
+			fullDump: fullDump ? true : "set TUI_STRESS_FULL_DUMP=1 for complete buffers and op log",
 		};
 		throw new Error(`TUI render stress invariant failed: ${message}\n${JSON.stringify(dump, null, 2)}`);
 	}
@@ -2366,6 +2678,8 @@ function createTerminal(scenario: Scenario): VirtualTerminal {
 			return new StaleBottomTerminal(scenario.columns, scenario.rows, scenario.scrollback, widthModel);
 		case "normal":
 			return new VirtualTerminal(scenario.columns, scenario.rows, scenario.scrollback, widthModel);
+		default:
+			return assertNever(scenario.terminalMode);
 	}
 }
 
@@ -2408,7 +2722,7 @@ function windowAround(lines: readonly string[], center: number): string[] {
 	return lines.slice(start, end);
 }
 
-function expectedScrollbackBuffer(frame: readonly string[], height: number, scrollback: number): string[] {
+export function expectedScrollbackBuffer(frame: readonly string[], height: number, scrollback: number): string[] {
 	const expected = [...frame];
 	while (expected.length < height) {
 		expected.push("");
@@ -2417,7 +2731,7 @@ function expectedScrollbackBuffer(frame: readonly string[], height: number, scro
 	return expected.length > cap ? expected.slice(expected.length - cap) : expected;
 }
 
-function scrollbackProbePositions(maxViewportY: number, frameLength: number, height: number): number[] {
+export function scrollbackProbePositions(maxViewportY: number, frameLength: number, height: number): number[] {
 	const maxY = Math.max(0, maxViewportY);
 	const positions = new Set<number>();
 	const add = (value: number): void => {
@@ -2435,7 +2749,7 @@ function scrollbackProbePositions(maxViewportY: number, frameLength: number, hei
 	return [...positions].sort((left, right) => left - right);
 }
 
-function duplicateNonblankLines(lines: readonly string[]): Set<string> {
+export function duplicateNonblankLines(lines: readonly string[]): Set<string> {
 	const seen = new Set<string>();
 	const duplicates = new Set<string>();
 	for (const line of lines) {
@@ -2452,33 +2766,119 @@ function expectedTerminalLine(line: string, width: number): string {
 	return stripPlainTerminalText(fitted).trimEnd();
 }
 
-function stripPlainTerminalText(text: string): string {
+export function stripPlainTerminalText(text: string): string {
 	return stripVTControlCharacters(text)
 		.replace(/\]8;;[^\x07]*(?:\x07)?/g, "")
 		.replaceAll(BEL, "");
 }
 
-// SGR sequence carrying a background color parameter (40-47 basic, 48 extended,
-// 100-107 bright). Used to mark which logical rows may legitimately produce
-// background-colored terminal cells.
-const BACKGROUND_SGR_REGEX = /\x1b\[(?:\d+;)*(?:4[0-8]|10[0-7])(?:;\d+)*m/;
+function findPrivateCsiTerminator(input: string, start: number): number {
+	return findCsiTerminator(input, start);
+}
 
-function expectedFrameFromLines(lines: readonly string[], width: number, height: number): ExpectedFrame {
+function findCsiTerminator(input: string, start: number): number {
+	for (let index = start; index < input.length; index++) {
+		const code = input.charCodeAt(index);
+		if (code >= 0x40 && code <= 0x7e) return index;
+	}
+	return -1;
+}
+
+function findOscTerminator(input: string, start: number): number {
+	for (let index = start; index < input.length; index++) {
+		const code = input.charCodeAt(index);
+		if (code === 0x07) return index + 1;
+		if (code === 0x1b && input[index + 1] === "\\") return index + 2;
+	}
+	return -1;
+}
+
+function parseCsiParameters(paramsText: string): number[] {
+	if (paramsText.length === 0) return [];
+	const params: number[] = [];
+	for (const part of paramsText.split(";")) {
+		if (part.length === 0) continue;
+		const parsed = Number.parseInt(part, 10);
+		if (Number.isFinite(parsed)) params.push(parsed);
+	}
+	return params;
+}
+
+function trailingPrivateCsiPrefixStart(input: string): number {
+	const esc = input.lastIndexOf(ESC);
+	if (esc === -1) return -1;
+	const tail = input.slice(esc);
+	return /^\x1b(?:\[?|\[\?[0-9;]*)$/.test(tail) ? esc : -1;
+}
+
+export function expectedFrameFromLines(lines: readonly string[], width: number, height: number): ExpectedFrame {
 	const stripped = [...lines];
 	const viewportTop = Math.max(0, stripped.length - height);
 	let cursor: ExpectedCursor | null = null;
-	const backgroundRows: boolean[] = new Array(stripped.length).fill(false);
+	const backgroundColumns: number[][] = Array.from({ length: stripped.length }, () => []);
 	for (let row = stripped.length - 1; row >= 0; row--) {
 		const line = stripped[row] ?? "";
-		backgroundRows[row] = BACKGROUND_SGR_REGEX.test(line);
 		const markerIndex = line.indexOf(CURSOR_MARKER);
-		if (markerIndex === -1) continue;
-		if (cursor === null && row >= viewportTop) {
+		const cleanLine = markerIndex === -1 ? line : removeCursorMarkers(line);
+		backgroundColumns[row] = expectedBackgroundColumns(cleanLine, width);
+		if (markerIndex !== -1 && cursor === null && row >= viewportTop) {
 			cursor = { row: row - viewportTop, col: visibleWidth(line.slice(0, markerIndex)) };
 		}
-		stripped[row] = removeCursorMarkers(line);
+		stripped[row] = cleanLine;
 	}
-	return { frame: stripped.map(line => expectedTerminalLine(line, width)), cursor, backgroundRows };
+	return { frame: stripped.map(line => expectedTerminalLine(line, width)), cursor, backgroundColumns };
+}
+
+function expectedBackgroundColumns(line: string, width: number): number[] {
+	const safeWidth = Math.max(1, width);
+	const fitted = visibleWidth(line) > safeWidth ? truncateToWidth(line, safeWidth, Ellipsis.Omit) : line;
+	const columns: number[] = [];
+	let backgroundActive = false;
+	let skipUntil = 0;
+	let col = 0;
+	for (const segment of SEGMENTER.segment(fitted)) {
+		if (segment.index < skipUntil) continue;
+		if (fitted.charCodeAt(segment.index) === 0x1b) {
+			const next = segment.index + 1;
+			if (fitted[next] === "[") {
+				const terminator = findCsiTerminator(fitted, next + 1);
+				if (terminator === -1) break;
+				if (fitted[terminator] === "m") {
+					backgroundActive = applySgrBackground(backgroundActive, fitted.slice(next + 1, terminator));
+				}
+				skipUntil = terminator + 1;
+				continue;
+			}
+			if (fitted[next] === "]") {
+				const terminator = findOscTerminator(fitted, next + 1);
+				if (terminator === -1) break;
+				skipUntil = terminator;
+				continue;
+			}
+		}
+		const segmentWidth = visibleWidth(segment.segment);
+		if (segmentWidth <= 0) continue;
+		if (backgroundActive) {
+			const end = Math.min(safeWidth, col + segmentWidth);
+			for (let column = col; column < end; column++) columns.push(column);
+		}
+		col += segmentWidth;
+		if (col >= safeWidth) break;
+	}
+	return columns;
+}
+
+function applySgrBackground(current: boolean, paramsText: string): boolean {
+	const params = parseCsiParameters(paramsText);
+	let active = current;
+	for (const param of params.length === 0 ? [0] : params) {
+		if (param === 0 || param === 49) {
+			active = false;
+		} else if ((param >= 40 && param <= 48) || (param >= 100 && param <= 107)) {
+			active = true;
+		}
+	}
+	return active;
 }
 
 function removeCursorMarkers(line: string): string {
@@ -2529,7 +2929,7 @@ function isExpectedOverlayVisible(entry: StressOverlayEntry, termWidth: number, 
 	return entry.options.visible?.(termWidth, termHeight) ?? true;
 }
 
-function resolveExpectedOverlayLayout(
+export function resolveExpectedOverlayLayout(
 	options: OverlayOptions | undefined,
 	overlayHeight: number,
 	termWidth: number,
@@ -2613,6 +3013,8 @@ function resolveExpectedAnchorRow(
 		case "center":
 		case "right-center":
 			return marginTop + Math.floor((availHeight - height) / 2);
+		default:
+			return assertNever(anchor);
 	}
 }
 
@@ -2635,10 +3037,12 @@ function resolveExpectedAnchorCol(
 		case "center":
 		case "bottom-center":
 			return marginLeft + Math.floor((availWidth - width) / 2);
+		default:
+			return assertNever(anchor);
 	}
 }
 
-function compositeExpectedLineAt(
+export function compositeExpectedLineAt(
 	baseLine: string,
 	overlayLine: string,
 	startCol: number,
@@ -2747,7 +3151,7 @@ function insertCursorMarker(text: string, mode: CursorMode, width: number): stri
 
 const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
-function cursorInsertionIndex(text: string, mode: CursorMode, width: number): number {
+export function cursorInsertionIndex(text: string, mode: CursorMode, width: number): number {
 	if (mode === "start") return 0;
 	if (mode === "end" || text.includes("\x1b")) return text.length;
 	const textWidth = visibleWidth(text);
@@ -2769,6 +3173,7 @@ function snapshotDump(snapshot: Snapshot): JsonObject {
 		buffer: snapshot.buffer,
 		view: snapshot.view,
 		viewBackgroundColumns: snapshot.viewBackgroundColumns,
+		frameBackgroundColumns: snapshot.frameBackgroundColumns,
 		position: { baseY: snapshot.position.baseY, viewportY: snapshot.position.viewportY },
 		cursor: cursorObject(snapshot),
 		expectedCursor:
@@ -2779,6 +3184,26 @@ function snapshotDump(snapshot: Snapshot): JsonObject {
 		width: snapshot.width,
 		height: snapshot.height,
 		frame: snapshot.frame,
+		atBottom: snapshot.atBottom,
+	};
+}
+
+function snapshotSummary(snapshot: Snapshot): JsonObject {
+	return {
+		bufferLength: snapshot.buffer.length,
+		view: snapshot.view,
+		viewBackgroundColumns: snapshot.viewBackgroundColumns,
+		position: { baseY: snapshot.position.baseY, viewportY: snapshot.position.viewportY },
+		cursor: cursorObject(snapshot),
+		expectedCursor:
+			snapshot.expectedCursor === null
+				? null
+				: { row: snapshot.expectedCursor.row, col: snapshot.expectedCursor.col },
+		redraws: snapshot.redraws,
+		width: snapshot.width,
+		height: snapshot.height,
+		frameLength: snapshot.frame.length,
+		frameTail: snapshot.frame.slice(-Math.min(snapshot.height + 3, snapshot.frame.length)),
 		atBottom: snapshot.atBottom,
 	};
 }
@@ -2795,35 +3220,13 @@ function maxOf(values: readonly number[]): number {
 	return max;
 }
 
-async function settle(term: VirtualTerminal): Promise<void> {
-	// Wait for the TUI's scheduled render to land using EVENT-LOOP ORDER, not
-	// wall-clock sleeps. The renderer schedules non-forced renders as
-	// process.nextTick(...) → setTimeout(..., 0) (the 16ms throttle always
-	// computes delay 0 under the mocked performance.now). Same-delay timers fire
-	// in creation order, so a nextTick + setTimeout(0) round issued here — after
-	// the op's requestRender() — runs strictly after the renderer's own chain,
-	// no matter how starved the worker thread is. A fixed Bun.sleep(1) raced that
-	// chain and lost under parallel-worker CPU contention, snapshotting torn
-	// mid-frame states that produced unreplayable "failures" (fails in a full
-	// cranked run, passes in isolation — see render-stress-journal.md iteration 5).
-	// Two rounds cover a render that re-requests itself; the trailing flush waits
-	// out xterm.js's own async write parsing.
-	for (let round = 0; round < 2; round++) {
-		const tick = Promise.withResolvers<void>();
-		process.nextTick(tick.resolve);
-		await tick.promise;
-		const timer = Promise.withResolvers<void>();
-		setTimeout(timer.resolve, 0);
-		await timer.promise;
-	}
-	await term.flush();
-}
-
 function parsePositiveInt(name: string, fallback: number): number {
 	const raw = Bun.env[name];
 	if (raw === undefined || raw.length === 0) return fallback;
-	const parsed = Number.parseInt(raw, 10);
-	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+	if (!/^[1-9]\d*$/.test(raw)) {
+		throw new Error(`${name} must be a positive integer; received ${JSON.stringify(raw)}`);
+	}
+	return Number.parseInt(raw, 10);
 }
 
 export function formatSeed(seed: number): string {
@@ -2838,9 +3241,10 @@ function scenarioEnv(envMode: EnvMode): Record<EnvKey, string | undefined> {
 		TERMUX_VERSION: envMode === "termux" ? "0.118.0" : undefined,
 		WEZTERM_PANE: undefined,
 		KITTY_WINDOW_ID: undefined,
-		GHOSTTY_RESOURCES_DIR: undefined,
+		GHOSTTY_RESOURCES_DIR: envMode === "ghostty" ? "/Applications/Ghostty.app/Contents/Resources" : undefined,
 		ALACRITTY_WINDOW_ID: undefined,
-		VTE_VERSION: undefined,
+		VTE_VERSION: envMode === "vteNoSync" ? "6800" : undefined,
+		PI_NO_SYNC_OUTPUT: envMode === "vteNoSync" ? "1" : undefined,
 		TERM_PROGRAM: envMode === "appleTerminal" ? "Apple_Terminal" : envMode === "iterm2" ? "iTerm.app" : undefined,
 		ITERM_SESSION_ID: envMode === "iterm2" ? "w0t0p0" : undefined,
 		// WSL fronted by Windows Terminal: WT propagates WT_SESSION into the
@@ -2855,16 +3259,21 @@ export function buildScenarios(): Scenario[] {
 	const soak = Bun.env.TUI_STRESS_SOAK === "1";
 	const templates = soak ? soakTemplates() : coreTemplates();
 	const replay = parseReplay(templates);
+	const replayOperations = parseReplayOperations();
+	if (replayOperations !== null && replay === null) {
+		throw new Error("TUI_STRESS_REPLAY_LOG requires TUI_STRESS_REPLAY to select the scenario and seed");
+	}
 	if (replay !== null) {
 		const maxHeight = maxOf(replay.template.heightChoices);
 		return [
 			materializeScenario(
 				replay.template,
 				replay.seed,
-				replay.iterations,
+				replayOperations?.length ?? replay.iterations,
 				SOAK_BULK_MAX,
 				SOAK_TIMEOUT_MS,
 				maxHeight,
+				replayOperations ?? undefined,
 			),
 		];
 	}
@@ -2894,17 +3303,25 @@ function materializeScenario(
 	bulkMax: number,
 	timeoutMs: number,
 	maxHeight: number,
+	replayOperations?: readonly OperationKind[],
 ): Scenario {
+	const strictScrollback =
+		template.envMode !== "tmux" && template.terminalMode === "normal" && template.platform !== "win32";
+	const foregroundStream = template.foregroundStream ?? false;
+	const reflow = template.reflow ?? false;
 	return {
 		...template,
 		seed,
 		iterations,
 		bulkMax,
 		scrollback: template.scrollbackRows ?? Math.max(10_000, maxHeight + 64 + iterations * (bulkMax + 8)),
-		strictScrollback:
-			template.envMode !== "tmux" && template.terminalMode === "normal" && template.platform !== "win32",
+		strictScrollback,
 		timeoutMs,
 		uniqueContent: template.uniqueContent ?? false,
+		foregroundStream,
+		reflow,
+		tags: scenarioTags(template, strictScrollback, foregroundStream),
+		replayOperations,
 	};
 }
 
@@ -2913,25 +3330,77 @@ function parseReplay(
 ): { template: ScenarioTemplate; seed: number; iterations: number } | null {
 	const raw = Bun.env.TUI_STRESS_REPLAY;
 	if (raw === undefined || raw.length === 0) return null;
-	const parsed = JSON.parse(raw) as JsonObject;
-	const scenario = typeof parsed.scenario === "string" ? parsed.scenario : "";
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		throw new Error(`Invalid TUI_STRESS_REPLAY JSON: ${raw}`, { cause: error });
+	}
+	if (!isJsonRecord(parsed)) {
+		throw new Error("Invalid TUI_STRESS_REPLAY: expected an object with scenario, seed, and optional iterations");
+	}
+	const scenario = parsed.scenario;
+	if (typeof scenario !== "string" || scenario.length === 0) {
+		throw new Error("Invalid TUI_STRESS_REPLAY.scenario: expected a non-empty scenario name");
+	}
 	const template = templates.find(candidate => candidate.name === scenario);
 	if (template === undefined) throw new Error(`Unknown TUI_STRESS_REPLAY scenario: ${scenario}`);
-	const iterations =
-		typeof parsed.iterations === "number" && Number.isFinite(parsed.iterations)
-			? Math.max(1, Math.floor(parsed.iterations))
-			: CORE_ITERATIONS;
+	const iterationsValue = parsed.iterations;
+	const iterations = iterationsValue === undefined ? CORE_ITERATIONS : parseReplayIterations(iterationsValue);
 	const seed = parseReplaySeed(parsed.seed);
 	return { template, seed, iterations };
 }
 
-function parseReplaySeed(seed: JsonValue | undefined): number {
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseReplayIterations(value: unknown): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 1) {
+		throw new Error("Invalid TUI_STRESS_REPLAY.iterations: expected a positive number");
+	}
+	return Math.floor(value);
+}
+
+function parseReplaySeed(seed: unknown): number {
 	if (typeof seed === "number" && Number.isFinite(seed)) return seed >>> 0;
 	if (typeof seed === "string") {
-		const parsed = Number.parseInt(seed, seed.startsWith("0x") || seed.startsWith("0X") ? 16 : 10);
-		if (Number.isFinite(parsed)) return parsed >>> 0;
+		const radix = seed.startsWith("0x") || seed.startsWith("0X") ? 16 : 10;
+		const valid = radix === 16 ? /^0x[0-9a-f]+$/i.test(seed) : /^\d+$/.test(seed);
+		if (!valid) throw new Error(`Invalid TUI_STRESS_REPLAY.seed: ${JSON.stringify(seed)}`);
+		return Number.parseInt(seed, radix) >>> 0;
 	}
-	return BASE_SEEDS[0];
+	throw new Error("Invalid TUI_STRESS_REPLAY.seed: expected a number or integer string");
+}
+
+function parseReplayOperations(): readonly OperationKind[] | null {
+	const path = Bun.env.TUI_STRESS_REPLAY_LOG;
+	if (path === undefined || path.length === 0) return null;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(fs.readFileSync(path, "utf8"));
+	} catch (error) {
+		throw new Error(`Invalid TUI_STRESS_REPLAY_LOG JSON: ${path}`, { cause: error });
+	}
+	const entries = Array.isArray(parsed)
+		? parsed
+		: isJsonRecord(parsed) && Array.isArray(parsed.operations)
+			? parsed.operations
+			: null;
+	if (entries === null) {
+		throw new Error("Invalid TUI_STRESS_REPLAY_LOG: expected an operation array or { operations } object");
+	}
+	const operations: OperationKind[] = [];
+	for (let index = 0; index < entries.length; index++) {
+		const entry = entries[index];
+		const kind = isJsonRecord(entry) ? entry.kind : entry;
+		if (kind === "periodicCheckpoint") continue;
+		if (!isOperationKind(kind)) {
+			throw new Error(`Invalid TUI_STRESS_REPLAY_LOG operation at index ${index}`);
+		}
+		operations.push(kind);
+	}
+	return operations;
 }
 
 function buildSeeds(count: number): number[] {
@@ -2945,11 +3414,32 @@ function buildSeeds(count: number): number[] {
 
 type ScenarioTemplate = Omit<
 	Scenario,
-	"seed" | "iterations" | "bulkMax" | "scrollback" | "strictScrollback" | "timeoutMs" | "uniqueContent"
+	| "seed"
+	| "iterations"
+	| "bulkMax"
+	| "scrollback"
+	| "strictScrollback"
+	| "timeoutMs"
+	| "uniqueContent"
+	| "foregroundStream"
+	| "reflow"
+	| "tags"
+	| "replayOperations"
 > & {
 	scrollbackRows?: number;
 	uniqueContent?: boolean;
+	foregroundStream?: boolean;
+	reflow?: boolean;
 };
+
+function writeReplayLog(scenario: Scenario, operations: readonly OperationLogEntry[]): string {
+	const filePath = path.join(
+		os.tmpdir(),
+		`omp-tui-stress-${scenario.name}-${(scenario.seed >>> 0).toString(16)}-${Date.now().toString(36)}.json`,
+	);
+	fs.writeFileSync(filePath, JSON.stringify(operations, null, 2));
+	return filePath;
+}
 
 function coreTemplates(): ScenarioTemplate[] {
 	return [
@@ -2970,6 +3460,22 @@ function coreTemplates(): ScenarioTemplate[] {
 			platform: "linux",
 			terminalMode: "normal",
 			envMode: "plain",
+			geometryMode: "small",
+			columns: 40,
+			rows: 6,
+			widthChoices: [10, 18, 32, 40],
+			heightChoices: [3, 4, 6],
+		},
+		{
+			// VTE 0.68 reports DEC 2026 synchronized output as permanently reset
+			// and users can opt out when a terminal's implementation is buggy or
+			// visually worse. The renderer must remove only the 2026 wrapper; it
+			// still keeps autowrap disabled around paints to avoid pending-wrap
+			// staircase corruption.
+			name: "linux-normal-vteNoSync-small",
+			platform: "linux",
+			terminalMode: "normal",
+			envMode: "vteNoSync",
 			geometryMode: "small",
 			columns: 40,
 			rows: 6,
@@ -3089,6 +3595,99 @@ function coreTemplates(): ScenarioTemplate[] {
 			heightChoices: [3, 4, 6],
 			scrollbackRows: 10_000,
 		},
+		{
+			// Native-Windows ConPTY host (Windows Terminal, Tabby, Hyper, VS Code,
+			// conhost behind ConPTY — #1635/#1746). kernel32 cannot see the host
+			// UI's scrollback (the pseudo-console buffer is pinned to the visible
+			// grid), and no env var distinguishes the hosts (Tabby sets none), so
+			// the probe is permanently `undefined`. A reader scrolled in the host
+			// UI must not be yanked by streaming-time rebuilds; reconciliation
+			// waits for explicit checkpoints.
+			name: "win32-unknown-small",
+			platform: "win32",
+			terminalMode: "unknown",
+			envMode: "plain",
+			geometryMode: "small",
+			columns: 32,
+			rows: 4,
+			widthChoices: [10, 16, 32],
+			heightChoices: [3, 4, 6],
+			scrollbackRows: 10_000,
+		},
+		{
+			// Foreground tool actively streaming on an ED3-risk terminal whose
+			// viewport position is unobservable (ghostty/kitty/alacritty/VTE/iTerm2;
+			// see `detectTerminalEagerEraseScrollbackRisk`). The agent requests an
+			// eager native-scrollback rebuild for the streaming turn, but that opt-in
+			// is gated off on ED3-risk terminals, so `allowUnknownViewportMutation`
+			// stays false and content frames flow through `viewportRepaint`/`diff`
+			// instead of a forced history rebuild. An offscreen-edit growth then
+			// repaints in place — advancing the rendered line count without committing
+			// the overflow to native history — and the next shrink must still
+			// re-anchor the bottom of the viewport from that lagging high-water mark.
+			// The default content-frame path forces `allowUnknownViewportMutation` and
+			// never reaches this state (a notification chip rendering over the active
+			// tool render: the original report).
+			name: "darwin-unknown-ghostty-stream-small",
+			platform: "darwin",
+			terminalMode: "unknown",
+			envMode: "ghostty",
+			geometryMode: "small",
+			columns: 32,
+			rows: 4,
+			widthChoices: [10, 16, 32],
+			heightChoices: [3, 4, 6],
+			scrollbackRows: 10_000,
+			foregroundStream: true,
+		},
+		{
+			name: "linux-unknown-ghostty-stream-large",
+			platform: "linux",
+			terminalMode: "unknown",
+			envMode: "ghostty",
+			geometryMode: "large",
+			columns: 80,
+			rows: 12,
+			widthChoices: [40, 80, 120],
+			heightChoices: [8, 12, 24],
+			scrollbackRows: 10_000,
+			foregroundStream: true,
+		},
+		{
+			// Width-reflowing content (wrapped/markdown-style) on the modern grapheme
+			// width model, where the wrap agrees with the terminal's cell widths. A
+			// width resize changes the physical line count, so the renderer must
+			// re-anchor the viewport and rebuild native history across a line-count
+			// change — not just retruncate rows. Combined with the full random op
+			// space (scroll, overlay, append, shrink) it covers reflow interactions
+			// the deterministic width tests exercise only in isolation.
+			name: "darwin-normal-reflow-small",
+			platform: "darwin",
+			terminalMode: "normal",
+			envMode: "plain",
+			geometryMode: "small",
+			widthModel: "modern",
+			columns: 32,
+			rows: 4,
+			widthChoices: [8, 12, 16, 24, 32, 40],
+			heightChoices: [3, 4, 6],
+			reflow: true,
+		},
+		{
+			name: "darwin-unknown-reflow-stream-large",
+			platform: "darwin",
+			terminalMode: "unknown",
+			envMode: "ghostty",
+			geometryMode: "large",
+			widthModel: "modern",
+			columns: 80,
+			rows: 12,
+			widthChoices: [24, 40, 80, 120],
+			heightChoices: [8, 12, 24],
+			scrollbackRows: 10_000,
+			reflow: true,
+			foregroundStream: true,
+		},
 	];
 }
 
@@ -3096,7 +3695,7 @@ function soakTemplates(): ScenarioTemplate[] {
 	const templates: ScenarioTemplate[] = [];
 	const platformEnvModes: readonly { platform: TestPlatform; envModes: readonly EnvMode[] }[] = [
 		{ platform: "darwin", envModes: ["plain", "tmux"] },
-		{ platform: "linux", envModes: ["plain", "tmux", "termux"] },
+		{ platform: "linux", envModes: ["plain", "tmux", "termux", "vteNoSync"] },
 		{ platform: "win32", envModes: ["plain"] },
 	];
 	const terminalModes: readonly TerminalMode[] = ["normal", "unknown", "intermittentUnknown", "staleBottom"];
@@ -3161,6 +3760,26 @@ function soakTemplates(): ScenarioTemplate[] {
 			});
 		}
 	}
+	// Foreground tool streaming on an ED3-risk terminal with an unobservable
+	// viewport (ghostty/kitty/…): the eager native-scrollback rebuild opt-in is
+	// gated off, so content frames repaint in place and offscreen-edit growth
+	// lags the high-water mark — a later shrink must still re-anchor the viewport
+	// bottom rather than drifting rows up over one another.
+	for (const geometryMode of geometries) {
+		const large = geometryMode === "large";
+		templates.push({
+			name: `darwin-unknown-ghostty-stream-${geometryMode}`,
+			platform: "darwin",
+			terminalMode: "unknown",
+			envMode: "ghostty",
+			geometryMode,
+			columns: large ? 80 : 32,
+			rows: large ? 12 : 4,
+			widthChoices: large ? [80, 120] : [2, 10, 16, 24, 32, 40],
+			heightChoices: large ? [8, 12, 24] : [3, 4, 6],
+			foregroundStream: true,
+		});
+	}
 	return templates;
 }
 
@@ -3182,6 +3801,7 @@ export function applyStressEnv(envMode: Scenario["envMode"]): StressEnvSnapshot 
 			GHOSTTY_RESOURCES_DIR: undefined,
 			ALACRITTY_WINDOW_ID: undefined,
 			VTE_VERSION: undefined,
+			PI_NO_SYNC_OUTPUT: undefined,
 			TERM_PROGRAM: undefined,
 			ITERM_SESSION_ID: undefined,
 			WT_SESSION: undefined,
@@ -3198,6 +3818,7 @@ export function applyStressEnv(envMode: Scenario["envMode"]): StressEnvSnapshot 
 			GHOSTTY_RESOURCES_DIR: undefined,
 			ALACRITTY_WINDOW_ID: undefined,
 			VTE_VERSION: undefined,
+			PI_NO_SYNC_OUTPUT: undefined,
 			TERM_PROGRAM: undefined,
 			ITERM_SESSION_ID: undefined,
 			WT_SESSION: undefined,
@@ -3237,16 +3858,24 @@ export function restoreStressEnv(snapshot: StressEnvSnapshot): void {
 	}
 }
 
+let stressEnvPatchDepth = 0;
+let platformPatchDepth = 0;
+
 async function withPatchedEnv<T>(envMode: Scenario["envMode"], run: () => Promise<T>): Promise<T> {
+	if (stressEnvPatchDepth > 0) throw new Error("Nested stress environment patching is not supported");
+	stressEnvPatchDepth += 1;
 	const snapshot = applyStressEnv(envMode);
 	try {
 		return await run();
 	} finally {
 		restoreStressEnv(snapshot);
+		stressEnvPatchDepth -= 1;
 	}
 }
 
 async function withPatchedPlatform<T>(platform: Scenario["platform"], run: () => Promise<T>): Promise<T> {
+	if (platformPatchDepth > 0) throw new Error("Nested stress platform patching is not supported");
+	platformPatchDepth += 1;
 	const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
 	Object.defineProperty(process, "platform", { configurable: true, value: platform });
 	try {
@@ -3254,7 +3883,10 @@ async function withPatchedPlatform<T>(platform: Scenario["platform"], run: () =>
 	} finally {
 		if (platformDescriptor !== undefined) {
 			Object.defineProperty(process, "platform", platformDescriptor);
+		} else {
+			Reflect.deleteProperty(process, "platform");
 		}
+		platformPatchDepth -= 1;
 	}
 }
 
@@ -3280,90 +3912,66 @@ export interface StressWorkerFailure {
 
 export type StressWorkerResponse = StressWorkerSuccess | StressWorkerFailure;
 
-async function withPatchedMonotonicNow<T>(run: () => Promise<T>): Promise<T> {
-	const descriptor = Object.getOwnPropertyDescriptor(performance, "now");
-	let monotonicNow = 0;
-	Object.defineProperty(performance, "now", {
-		configurable: true,
-		value: () => {
-			monotonicNow += 20;
-			return monotonicNow;
-		},
-	});
-	try {
-		return await run();
-	} finally {
-		if (descriptor === undefined) {
-			Reflect.deleteProperty(performance, "now");
-		} else {
-			Object.defineProperty(performance, "now", descriptor);
-		}
+export async function runStressScenario(scenario: Scenario, options?: { patchEnv?: boolean }): Promise<void> {
+	const run = async (): Promise<void> => {
+		await withPatchedPlatform(scenario.platform, async () => {
+			const driver = new StressDriver(scenario);
+			await driver.run();
+		});
+	};
+	if (options?.patchEnv === false) {
+		await run();
+	} else {
+		await withPatchedEnv(scenario.envMode, run);
 	}
 }
 
-export async function runStressScenario(scenario: Scenario, options?: { patchEnv?: boolean }): Promise<void> {
-	await withPatchedMonotonicNow(async () => {
-		const run = async (): Promise<void> => {
-			await withPatchedPlatform(scenario.platform, async () => {
-				const driver = new StressDriver(scenario);
-				await driver.run();
-			});
-		};
-		if (options?.patchEnv === false) {
-			await run();
-		} else {
-			await withPatchedEnv(scenario.envMode, run);
-		}
-	});
-}
-
 export async function runPreexistingScrollbackRegression(): Promise<void> {
-	await withPatchedMonotonicNow(async () => {
-		const term = new VirtualTerminal(40, 5, 100);
-		term.write(`${Array.from({ length: 12 }, (_value, index) => `shell-${index}`).join("\r\n")}\r\n`);
-		await settle(term);
+	const term = new VirtualTerminal(40, 5, 100);
+	const scheduler = new StressRenderScheduler();
+	term.write(`${Array.from({ length: 12 }, (_value, index) => `shell-${index}`).join("\r\n")}\r\n`);
+	await term.flush();
 
-		const tui = new TUI(term, true);
-		const component = new MutableLinesComponent(["ui-0", "ui-1", "ui-2"]);
-		tui.addChild(component);
+	const tui = new TUI(term, true, { renderScheduler: scheduler });
+	const component = new MutableLinesComponent(["ui-0", "ui-1", "ui-2"]);
+	tui.addChild(component);
 
-		try {
-			tui.start();
-			await settle(term);
+	try {
+		tui.start();
+		await scheduler.drain(term);
 
-			const externalRows = normalizeLines(term.getScrollBuffer()).filter(line => line.startsWith("shell-"));
-			if (externalRows.length === 0) {
-				throw new Error("Test setup failed: preexisting shell scrollback did not survive initial TUI paint");
-			}
+		const externalRows = normalizeLines(term.getScrollBuffer()).filter(line => line.startsWith("shell-"));
+		if (externalRows.length === 0) {
+			throw new Error("Test setup failed: preexisting shell scrollback did not survive initial TUI paint");
+		}
 
-			const frames = [
-				["ui-0", "inserted-0", "ui-1", "ui-2"],
-				["ui-0", "inserted-1", "ui-1", "ui-2"],
-				["ui-0", "ui-1", "ui-2"],
-				["prefix", "ui-0", "ui-1", "ui-2"],
-			] as const;
+		const frames = [
+			["ui-0", "inserted-0", "ui-1", "ui-2"],
+			["ui-0", "inserted-1", "ui-1", "ui-2"],
+			["ui-0", "ui-1", "ui-2"],
+			["prefix", "ui-0", "ui-1", "ui-2"],
+		] as const;
 
-			for (let index = 0; index < frames.length; index++) {
-				component.setLines(frames[index]!);
-				tui.requestRender();
-				await settle(term);
+		for (let index = 0; index < frames.length; index++) {
+			component.setLines(frames[index]!);
+			tui.requestRender();
+			await scheduler.drain(term);
 
-				const buffer = normalizeLines(term.getScrollBuffer());
-				for (const row of externalRows) {
-					if (!buffer.includes(row)) {
-						throw new Error(
-							`Preexisting shell scrollback was cleared by visible structural mutation\n${JSON.stringify(
-								{ mutationIndex: index, missing: row, externalRows, buffer },
-								null,
-								2,
-							)}`,
-						);
-					}
+			const buffer = normalizeLines(term.getScrollBuffer());
+			for (const row of externalRows) {
+				if (!buffer.includes(row)) {
+					throw new Error(
+						`Preexisting shell scrollback was cleared by visible structural mutation\n${JSON.stringify(
+							{ mutationIndex: index, missing: row, externalRows, buffer },
+							null,
+							2,
+						)}`,
+					);
 				}
 			}
-		} finally {
-			tui.stop();
-			await term.flush();
 		}
-	});
+	} finally {
+		tui.stop();
+		await term.flush();
+	}
 }

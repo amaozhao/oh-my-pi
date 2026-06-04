@@ -4,6 +4,31 @@
 
 ### Added
 
+- Added the `tui.maxInlineImages` setting (default `3`) capping how many inline images render as live terminal graphics. Once a new image pushes the count past the cap, the oldest images are hidden via a full redraw — replaced by their `[Image: …]` text placeholder and purged from the terminal's graphics store — so long sessions with many screenshots/diagrams stop piling up images (and, on Kitty, stop leaving scrollback ghosts). Set to `0` to keep every image inline.
+
+### Changed
+
+- Changed the `ask` tool transcript renderer to mark single-choice questions with circular radio glyphs (`○`/`◉`) instead of the rectangular checkbox glyphs (`☐`/`☑`) it shares with multi-select questions, so a "pick one" combo box visually reads as a radio group rather than a checklist. Multi-select questions keep checkboxes. Added a `radio.selected`/`radio.unselected` symbol pair across the unicode, nerd-font, and ASCII presets.
+
+### Fixed
+
+- Fixed selector dialogs (the `ask` tool, hook prompts) collapsing to a single visible option on shorter terminals when options carried long descriptions: the highlighted option's wrapped description consumed the entire row budget, hiding every other option and making the menu feel unnavigable (down moved the lone visible entry, left/right did nothing). When the fully-expanded list overflows, `HookSelectorComponent` now renders a compact list — every option label stays on screen and only the highlighted option expands its description, truncated to the remaining rows — so the whole menu is always visible and the detail pane follows the cursor.
+- Fixed `read` failing with "Path not found" on web URLs whose scheme `//` collapsed to a single `/` (e.g. `https:/github.com/...`), which happens when a URL is routed through Node's `path.normalize`/`path.resolve`. The fetch URL recognizer now accepts a single-slash scheme and repairs it back to `//` before fetching, so collapsed URLs resolve instead of falling through to filesystem lookup.
+
+## [15.8.3] - 2026-06-03
+### Fixed
+
+- Fixed Jujutsu workspace detection failing in non-default workspaces created by `jj workspace add`, whose `.jj/repo` is a FILE pointing at the shared repo dir rather than a directory. Detection now matches jj's own criterion (`.jj/repo` present, file or dir) instead of requiring a `.jj/repo/store` directory, and `jj.repo.resolve`'s `storeDir` follows the file indirection to the shared store.
+
+### Changed
+
+- Changed the `todo-write` prompt to require initializing every item from a user-supplied multi-step plan as an individual todo task before execution
+- Changed context compaction (prune/shake) to protect reads of the active plan file the same way it already protects `skill://` reads, so the plan stays intact through automatic and manual compaction. Both the canonical `local://PLAN.md` alias and the session's current plan reference path (e.g. a titled `local://<title>.md` after approval) are kept, tolerating read selectors and `local:/` scheme spelling.
+
+## [15.8.2] - 2026-06-03
+
+### Added
+
 - Added a bundled TypeScript rule that warns against leaving `@deprecated` compatibility shims behind instead of finishing a refactor.
 
 ### Fixed
