@@ -10,10 +10,10 @@ import {
 	LocalProtocolHandler,
 	type ProtocolHandler,
 } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { FindTool } from "@oh-my-pi/pi-coding-agent/tools/find";
 import { SearchTool } from "@oh-my-pi/pi-coding-agent/tools/search";
-import { AgentRegistry } from "../../src/registry/agent-registry";
 
 function getResultText(result: { content: Array<{ type: string; text?: string }> }): string {
 	return result.content
@@ -251,7 +251,7 @@ describe("SearchTool internal URL resolution", () => {
 		const text = getResultText(result);
 		expect(text).toContain("needle");
 		// No hashline section headers or numbered editable lines for immutable sources.
-		expect(text).not.toMatch(/^¶.*#[0-9A-F]{4}$/m);
+		expect(text).not.toMatch(/^\[[^#\r\n]+#[0-9A-F]{4}\]$/m);
 		expect(text).not.toMatch(/^\*?\s*\d+:/m);
 	});
 
@@ -291,7 +291,7 @@ describe("SearchTool internal URL resolution", () => {
 		const text = getResultText(result);
 		expect(text).toContain("needle");
 		// Mutable local:// sources keep a hashline section header plus numbered match lines.
-		expect(text).toMatch(/^¶.*#[0-9A-F]{4}$/m);
+		expect(text).toMatch(/^\[[^#\r\n]+#[0-9A-F]{4}\]$/m);
 		expect(text).toMatch(/^\*\d+:.*needle/m);
 	});
 
