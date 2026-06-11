@@ -33,8 +33,7 @@ async function createSelector(state: ProviderDiscoveryState): Promise<ModelSelec
 		getAvailable: () => [],
 		getAll: () => [],
 		getDiscoverableProviders: () => [state.provider],
-		getCanonicalModels: () => [],
-		resolveCanonicalModel: () => undefined,
+		getCanonicalModelSelections: () => [],
 		getProviderDiscoveryState: () => state,
 	} as unknown as ModelRegistry;
 	const ui = { requestRender: vi.fn() } as unknown as TUI;
@@ -118,13 +117,7 @@ describe("issue #970 custom provider discovery", () => {
 			});
 		};
 
-		// NOTE: ModelRegistryImpl has no fetch injection seam; fetchMock cannot be
-		// passed to the constructor. Missing API: ModelRegistry constructor (or
-		// refreshProvider) must accept a `fetch` option to avoid global override.
-		// Tracked: packages/coding-agent/src/config/model-registry.ts #discoverOpenAIModelsList
-		void fetchMock;
-
-		const registry = new ModelRegistryImpl(authStorage, modelsPath);
+		const registry = new ModelRegistryImpl(authStorage, modelsPath, { fetch: fetchMock });
 		await registry.refreshProvider("vllm");
 
 		const providerModels = registry.getAll().filter(model => model.provider === "vllm");
