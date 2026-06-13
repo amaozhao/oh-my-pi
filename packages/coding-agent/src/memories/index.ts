@@ -11,6 +11,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import consolidationTemplate from "../prompts/memories/consolidation.md" with { type: "text" };
+import consolidationSystemTemplate from "../prompts/memories/consolidation_system.md" with { type: "text" };
 import readPathTemplate from "../prompts/memories/read-path.md" with { type: "text" };
 import stageOneInputTemplate from "../prompts/memories/stage_one_input.md" with { type: "text" };
 import stageOneSystemTemplate from "../prompts/memories/stage_one_system.md" with { type: "text" };
@@ -273,11 +274,7 @@ async function runPhase1(options: {
 			const result = await runStage1Job({
 				claim,
 				model: phase1Model,
-				apiKey: modelRegistry.resolver(phase1Model.provider, {
-					sessionId: session.sessionId,
-					baseUrl: phase1Model.baseUrl,
-					modelId: phase1Model.id,
-				}),
+				apiKey: modelRegistry.resolver(phase1Model, session.sessionId),
 				modelMaxTokens: computeModelTokenBudget(phase1Model, config),
 				config,
 				metadata: session.agent?.metadataForProvider(phase1Model.provider),
@@ -434,11 +431,7 @@ async function runPhase2(options: {
 			const consolidated = await runConsolidationModel({
 				memoryRoot,
 				model: phase2Model,
-				apiKey: modelRegistry.resolver(phase2Model.provider, {
-					sessionId: session.sessionId,
-					baseUrl: phase2Model.baseUrl,
-					modelId: phase2Model.id,
-				}),
+				apiKey: modelRegistry.resolver(phase2Model, session.sessionId),
 				metadata: session.agent?.metadataForProvider(phase2Model.provider),
 			});
 			await applyConsolidation(memoryRoot, consolidated);
@@ -752,6 +745,7 @@ async function runConsolidationModel(options: {
 	const response = await completeSimple(
 		model,
 		{
+			systemPrompt: [consolidationSystemTemplate],
 			messages: [{ role: "user", content: [{ type: "text", text: input }], timestamp: Date.now() }],
 		},
 		{

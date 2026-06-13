@@ -1,28 +1,17 @@
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { toFirepassWireModelId, toFireworksWireModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
 import { isDeepseekModelIdOrName } from "@oh-my-pi/pi-catalog/identity";
-import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
+import { getSupportedEfforts, resolveWireModelId } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type { ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copilot";
 import { $env, extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
-import OpenAI, { APIConnectionTimeoutError as OpenAIConnectionTimeoutError } from "openai";
-import type {
-	ChatCompletionAssistantMessageParam,
-	ChatCompletionChunk,
-	ChatCompletionContentPart,
-	ChatCompletionContentPartImage,
-	ChatCompletionContentPartText,
-	ChatCompletionMessageParam,
-	ChatCompletionToolMessageParam,
-} from "openai/resources/chat/completions";
 import packageJson from "../../package.json" with { type: "json" };
 import { getKimiCommonHeaders } from "../registry/oauth/kimi";
 import { getEnvApiKey } from "../stream";
 import {
 	type AssistantMessage,
 	type Context,
-	type FetchImpl,
 	type Message,
 	type MessageAttribution,
 	type Model,
@@ -56,12 +45,13 @@ import {
 	getOpenAIStreamFirstEventTimeoutMs,
 	getOpenAIStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
+	iterateWithTerminalGrace,
 } from "../utils/idle-iterator";
 import { parseStreamingJson, parseStreamingJsonThrottled } from "../utils/json-parse";
+import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry } from "../utils/retry";
 import { adaptSchemaForStrict, NO_STRICT, toolWireSchema } from "../utils/schema";
-import { notifyRawSseEvent } from "../utils/sse-debug";
 import {
 	getStreamMarkupHealingPattern,
 	type HealedToolCall,
@@ -75,6 +65,17 @@ import {
 	hasCopilotVisionInput,
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
+import type {
+	ChatCompletionAssistantMessageParam,
+	ChatCompletionChunk,
+	ChatCompletionContentPart,
+	ChatCompletionContentPartImage,
+	ChatCompletionContentPartText,
+	ChatCompletionCreateParamsStreaming,
+	ChatCompletionMessageParam,
+	ChatCompletionTool,
+	ChatCompletionToolMessageParam,
+} from "./openai-chat-wire";
 import { createInitialResponsesAssistantMessage } from "./openai-responses-shared";
 import { transformMessages } from "./transform-messages";
 import {
@@ -112,10 +113,16 @@ function resolveOpenAICompletionsModelId(
 	model: Model<"openai-completions">,
 	options: OpenAICompletionsOptions | undefined,
 ): string {
-	if (model.provider === "firepass") return toFirepassWireModelId(model.id);
-	if (model.provider === "fireworks") return toFireworksWireModelId(model.id);
-	if (model.provider === "openrouter") return applyOpenRouterRoutingVariant(model.id, options?.openrouterVariant);
-	return model.id;
+	// Effort-tier variants route per request effort (off → bare id, efforts →
+	// the thinking backing id); catalog variants (Copilot long-context `-1m`
+	// entries) pin via `requestModelId`; everything else serializes `model.id`.
+	const effort =
+		options?.reasoning && !options.disableReasoning && model.reasoning ? (options.reasoning as Effort) : undefined;
+	const wireId = resolveWireModelId(model, effort);
+	if (model.provider === "firepass") return toFirepassWireModelId(wireId);
+	if (model.provider === "fireworks") return toFireworksWireModelId(wireId);
+	if (model.provider === "openrouter") return applyOpenRouterRoutingVariant(wireId, options?.openrouterVariant);
+	return wireId;
 }
 
 /**
@@ -260,7 +267,7 @@ export interface OpenAICompletionsOptions extends StreamOptions {
 	openrouterVariant?: string;
 }
 
-type OpenAICompletionsParams = OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & {
+type OpenAICompletionsParams = ChatCompletionCreateParamsStreaming & {
 	top_k?: number;
 	min_p?: number;
 	repetition_penalty?: number;
@@ -276,7 +283,7 @@ type AppliedToolStrictMode = "mixed" | "all_strict" | "none";
 type ToolStrictModeOverride = Exclude<ResolvedOpenAICompat["toolStrictMode"], "mixed"> | undefined;
 
 type BuiltOpenAICompletionTools = {
-	tools: OpenAI.Chat.Completions.ChatCompletionTool[];
+	tools: ChatCompletionTool[];
 	toolStrictMode: AppliedToolStrictMode;
 	/** True when at least one wire tool was sent with `strict: true`. */
 	strictToolsApplied: boolean;
@@ -392,20 +399,13 @@ function getTrailingPartialDeepseekToken(text: string): string {
 }
 const OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"OpenAI completions stream timed out while waiting for the first event";
-
-async function* observeDecodedOpenAICompletionChunks(
-	chunks: AsyncIterable<ChatCompletionChunk>,
-	observer: (event: RawSseEvent) => void,
-): AsyncGenerator<ChatCompletionChunk> {
-	for await (const chunk of chunks) {
-		const data = JSON.stringify(chunk);
-		const event = typeof chunk.object === "string" ? chunk.object : null;
-		const raw = event === null ? [`data: ${data}`] : [`event: ${event}`, `data: ${data}`];
-		// Reconstructed from decoded SDK event; not literal wire bytes.
-		notifyRawSseEvent(observer, { event, data, raw });
-		yield chunk;
-	}
-}
+// How long to keep draining the stream after a `finish_reason` chunk arrived.
+// Compliant hosts follow it (almost) immediately with an optional usage-only
+// chunk and the `[DONE]` sentinel, so the window only ever elapses on hosts
+// that hold the connection open after the response logically completed —
+// without it the turn parks on `iterator.next()` until the idle watchdog
+// converts the already-successful response into a timeout error.
+const OPENAI_COMPLETIONS_POST_FINISH_GRACE_MS = 2_500;
 
 export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 	model: Model<"openai-completions">,
@@ -417,7 +417,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 	(async () => {
 		const startTime = Date.now();
 		let firstTokenTime: number | undefined;
-		let getCapturedErrorResponse: (() => CapturedHttpErrorResponse | undefined) | undefined;
 
 		const output: AssistantMessage = createInitialResponsesAssistantMessage(model.api, model.provider, model.id);
 		let rawRequestDump: RawHttpRequestDump | undefined;
@@ -425,7 +424,26 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 		const firstEventTimeoutAbortError = new Error(OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE);
 		const { requestAbortController, requestSignal } = abortTracker;
 		const onSseEvent = options?.onSseEvent;
-		const rawSseObserver = onSseEvent ? (event: RawSseEvent) => onSseEvent(event, model) : undefined;
+		const rawSseObserver = onSseEvent
+			? (event: RawSseEvent) => {
+					if (!event.event && event.data && event.data !== "[DONE]") {
+						try {
+							const parsed = JSON.parse(event.data);
+							const resolvedEvent =
+								typeof parsed.type === "string"
+									? parsed.type
+									: typeof parsed.object === "string"
+										? parsed.object
+										: null;
+							if (resolvedEvent) {
+								event.event = resolvedEvent;
+								event.raw = [`event: ${resolvedEvent}`, ...event.raw];
+							}
+						} catch {}
+					}
+					onSseEvent(event, model);
+				}
+			: undefined;
 		// Assigned once the block helpers exist (they are scoped to the `try`);
 		// the catch handler uses it to close any open blocks before emitting the
 		// terminal error so both exit paths obey the same block lifecycle.
@@ -439,16 +457,14 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				options?.streamFirstEventTimeoutMs ?? getOpenAIStreamFirstEventTimeoutMs(idleTimeoutMs);
 			const requestTimeoutMs =
 				firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0 ? firstEventTimeoutMs : undefined;
-			const {
-				client,
-				copilotPremiumRequests,
-				baseUrl,
-				requestHeaders,
-				getCapturedErrorResponse: captureErrorResponse,
-				clearCapturedErrorResponse,
-			} = await createClient(model, context, apiKey, options?.headers, options?.initiatorOverride, options?.fetch);
+			const { copilotPremiumRequests, baseUrl, headers, query, requestHeaders } = await createRequestSetup(
+				model,
+				context,
+				apiKey,
+				options?.headers,
+				options?.initiatorOverride,
+			);
 			const premiumRequestsTotal = copilotPremiumRequests;
-			getCapturedErrorResponse = captureErrorResponse;
 			let appliedStrictTools = false;
 			const providerSessionState = getOpenAICompletionsProviderSessionState(
 				model,
@@ -457,8 +473,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			);
 			let disableStrictTools = providerSessionState?.strictToolsDisabled ?? false;
 			let strictFallbackErrorMessage: string | undefined;
+			const trimmedBaseUrl = baseUrl.replace(/\/+$/, "");
+			const completionsUrl = query
+				? `${trimmedBaseUrl}/chat/completions?${new URLSearchParams(query)}`
+				: `${trimmedBaseUrl}/chat/completions`;
 			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
-				clearCapturedErrorResponse();
 				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
 				const { params, strictToolsApplied } = buildParams(
 					model,
@@ -473,14 +492,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					api: output.api,
 					model: model.id,
 					method: "POST",
-					url: `${baseUrl}/chat/completions`,
+					url: completionsUrl,
 					headers: requestHeaders,
 					body: params,
 				};
-				const requestOptions =
-					requestTimeoutMs === undefined
-						? { signal: requestSignal }
-						: { signal: requestSignal, timeout: requestTimeoutMs };
 				let requestTimeout: NodeJS.Timeout | undefined;
 				if (requestTimeoutMs !== undefined) {
 					requestTimeout = setTimeout(
@@ -489,17 +504,26 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					);
 				}
 				try {
-					const { data, response, request_id } = await client.chat.completions
-						.create(params, requestOptions)
-						.withResponse();
-					await notifyProviderResponse(options, response, model, request_id);
-					return data;
-				} catch (error) {
-					if (error instanceof OpenAIConnectionTimeoutError && !abortTracker.wasCallerAbort()) {
-						throw firstEventTimeoutAbortError;
+					const headersWithTimeout = { ...headers };
+					if (requestTimeoutMs !== undefined) {
+						headersWithTimeout["X-Stainless-Timeout"] = Math.floor(requestTimeoutMs / 1000).toString();
 					}
-					throw error;
+					const { events, response, requestId } = await postOpenAIStream<ChatCompletionChunk>({
+						url: completionsUrl,
+						headers: headersWithTimeout,
+						body: params,
+						signal: requestSignal,
+						fetch: options?.fetch,
+						// With a first-event watchdog armed, transport retries must
+						// not silently extend the deadline (old SDK `maxRetries: 0`).
+						maxAttempts: requestTimeoutMs === undefined ? undefined : 1,
+						onSseEvent: rawSseObserver,
+					});
+					await notifyProviderResponse(options, response, model, requestId);
+					return events;
 				} finally {
+					// Headers arrived (or the request failed); from here the
+					// first-event deadline is enforced by `iterateWithIdleTimeout`.
 					if (requestTimeout !== undefined) clearTimeout(requestTimeout);
 				}
 			};
@@ -510,7 +534,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					signal: requestSignal,
 				});
 			} catch (error) {
-				const capturedErrorResponse = getCapturedErrorResponse();
+				const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
 				if (
 					isOpenRouterAnthropicModel(model) &&
 					!disableStrictTools &&
@@ -748,6 +772,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				for (const call of calls) emitHealedToolCall(call);
 			};
 
+			// Terminal-chunk bookkeeping for the post-finish grace window below.
+			// `streamFinishedAt` flips when a chunk carries `finish_reason`;
+			// `sawUsagePayload` flips when any usage payload was parsed.
+			let streamFinishedAt: number | undefined;
+			let sawUsagePayload = false;
 			const timedOpenaiStream = iterateWithIdleTimeout(openaiStream, {
 				idleTimeoutMs,
 				firstItemTimeoutMs: firstEventTimeoutMs,
@@ -758,10 +787,16 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				abortSignal: options?.signal,
 				isProgressItem: isOpenAICompletionsProgressChunk,
 			});
-			const observedOpenaiStream = rawSseObserver
-				? observeDecodedOpenAICompletionChunks(timedOpenaiStream, rawSseObserver)
-				: timedOpenaiStream;
-			for await (const chunk of observedOpenaiStream) {
+			const terminalAwareStream = iterateWithTerminalGrace(timedOpenaiStream, {
+				finishedAtMs: () => streamFinishedAt,
+				graceMs: OPENAI_COMPLETIONS_POST_FINISH_GRACE_MS,
+				// The inner idle-timeout generator is parked mid-`next()` when the
+				// grace window closes, so abort the transport to settle that read
+				// and release the socket immediately (a queued `.return()` alone
+				// would wait on the never-arriving next chunk).
+				onGraceEnd: () => requestAbortController.abort(),
+			});
+			for await (const chunk of terminalAwareStream) {
 				if (!chunk || typeof chunk !== "object") continue;
 
 				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
@@ -776,15 +811,23 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 
 				if (chunk.usage) {
 					output.usage = parseChunkUsage(chunk.usage, model, premiumRequestsTotal);
+					sawUsagePayload = true;
 				}
 
 				const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
-				if (!choice) continue;
+				if (!choice) {
+					// Trailing usage-only chunk (`stream_options.include_usage`) after
+					// `finish_reason`: the response is complete — stop pulling instead
+					// of waiting for `[DONE]`/close from hosts that never send either.
+					if (streamFinishedAt !== undefined && sawUsagePayload) break;
+					continue;
+				}
 
 				if (!chunk.usage) {
 					const choiceUsage = getChoiceUsage(choice);
 					if (choiceUsage) {
 						output.usage = parseChunkUsage(choiceUsage, model, premiumRequestsTotal);
+						sawUsagePayload = true;
 					}
 				}
 
@@ -794,6 +837,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					if (finishReasonResult.errorMessage) {
 						output.errorMessage = finishReasonResult.errorMessage;
 					}
+					streamFinishedAt ??= Date.now();
 				}
 
 				if (choice.delta) {
@@ -967,6 +1011,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 						}
 					}
 				}
+
+				// `finish_reason` + usage both observed: the chat-completions
+				// contract has nothing left to deliver. Break instead of waiting
+				// for `[DONE]`/connection close so hosts that hold the socket open
+				// can't park the turn until the idle watchdog errors it out.
+				if (streamFinishedAt !== undefined && sawUsagePayload) break;
 			}
 
 			if (streamMarkupHealing) {
@@ -1036,10 +1086,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			for (const block of output.content) delete (block as any).index;
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error) ?? getCapturedErrorResponse?.()?.status;
+			const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
+			output.errorStatus = extractHttpStatusFromError(error) ?? capturedErrorResponse?.status;
 			output.errorMessage =
 				firstEventTimeoutError?.message ??
-				(await finalizeErrorMessage(error, rawRequestDump, getCapturedErrorResponse?.()));
+				(await finalizeErrorMessage(error, rawRequestDump, capturedErrorResponse));
 			// Some providers via OpenRouter include extra details here.
 			const rawMetadata = (error as { error?: { metadata?: { raw?: string } } })?.error?.metadata?.raw;
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
@@ -1054,20 +1105,21 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 	return stream;
 };
 
-async function createClient(
+async function createRequestSetup(
 	model: Model<"openai-completions">,
 	context: Context,
 	apiKey?: string,
 	extraHeaders?: Record<string, string>,
 	initiatorOverride?: MessageAttribution,
-	fetchOverride?: FetchImpl,
 ): Promise<{
-	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
-	baseUrl: string | undefined;
+	baseUrl: string;
+	/** Headers sent on the wire, including `Authorization`. */
+	headers: Record<string, string>;
+	/** Query params appended to the request URL (Azure `api-version`). */
+	query: Record<string, string> | undefined;
+	/** Headers recorded in `rawRequestDump` (sans `Authorization`). */
 	requestHeaders: Record<string, string>;
-	getCapturedErrorResponse: () => CapturedHttpErrorResponse | undefined;
-	clearCapturedErrorResponse: () => void;
 }> {
 	if (!apiKey) {
 		if (!$env.OPENAI_API_KEY) {
@@ -1085,8 +1137,8 @@ async function createClient(
 		// analytics. `HTTP-Referer` is the unique app identifier; without it nothing is
 		// tracked. `X-OpenRouter-Title` is the display name (`X-Title` is the legacy
 		// alias kept for back-compat). `X-OpenRouter-Categories` slots us into the
-		// `cli-agent` marketplace category. `User-Agent` overrides the default OpenAI
-		// SDK UA so traffic is identifiable in upstream provider logs.
+		// `cli-agent` marketplace category. `User-Agent` makes our traffic
+		// identifiable in upstream provider logs.
 		// https://openrouter.ai/docs/app-attribution
 		headers["User-Agent"] = `Oh-My-Pi/${packageJson.version}`;
 		headers["HTTP-Referer"] = "https://omp.sh/";
@@ -1133,52 +1185,16 @@ async function createClient(
 		}
 		azureDefaultQuery = { "api-version": apiVersion };
 	}
-	let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
-	const baseFetch = fetchOverride ?? fetch;
-	const wrappedFetch = Object.assign(
-		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-			const response = await baseFetch(input, init);
-			if (response.ok) {
-				capturedErrorResponse = undefined;
-				return response;
-			}
-			let bodyText: string | undefined;
-			let bodyJson: unknown;
-			try {
-				bodyText = await response.clone().text();
-				if (bodyText.trim().length > 0) {
-					try {
-						bodyJson = JSON.parse(bodyText);
-					} catch {}
-				}
-			} catch {}
-			capturedErrorResponse = {
-				status: response.status,
-				headers: response.headers,
-				bodyText,
-				bodyJson,
-			};
-			return response;
-		},
-		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
-	);
+	// The removed SDK client resolved its base URL as
+	// `baseURL ?? $OPENAI_BASE_URL ?? https://api.openai.com/v1`; keep that
+	// resolution explicit now that we build the request URL ourselves.
+	const resolvedBaseUrl = baseUrl ?? ($env.OPENAI_BASE_URL?.trim() || "https://api.openai.com/v1");
 	return {
-		client: new OpenAI({
-			apiKey,
-			baseURL: baseUrl,
-			dangerouslyAllowBrowser: true,
-			maxRetries: 5,
-			defaultHeaders: headers,
-			defaultQuery: azureDefaultQuery,
-			fetch: wrappedFetch,
-		}),
 		copilotPremiumRequests,
-		baseUrl,
+		baseUrl: resolvedBaseUrl,
+		headers: { Authorization: `Bearer ${apiKey}`, ...headers },
+		query: azureDefaultQuery,
 		requestHeaders: headers,
-		getCapturedErrorResponse: () => capturedErrorResponse,
-		clearCapturedErrorResponse: () => {
-			capturedErrorResponse = undefined;
-		},
 	};
 }
 
@@ -1333,7 +1349,10 @@ function buildParams(
 			openRouterParams.reasoning = { enabled: false };
 		} else if (options?.reasoning) {
 			openRouterParams.reasoning = {
-				effort: mapReasoningEffort(options.reasoning, compat.reasoningEffortMap),
+				effort:
+					compat.reasoningEffortMap?.[options.reasoning] ??
+					model.thinking?.effortMap?.[options.reasoning] ??
+					options.reasoning,
 			};
 		}
 	} else if (
@@ -1344,7 +1363,9 @@ function buildParams(
 		compat.supportsReasoningEffort
 	) {
 		// OpenAI-style reasoning_effort
-		params.reasoning_effort = mapReasoningEffort(options.reasoning, compat.reasoningEffortMap) as Effort;
+		params.reasoning_effort = (compat.reasoningEffortMap?.[options.reasoning] ??
+			model.thinking?.effortMap?.[options.reasoning] ??
+			options.reasoning) as Effort;
 	} else if (
 		supportsReasoningParams &&
 		options?.disableReasoning &&
@@ -1359,7 +1380,9 @@ function buildParams(
 		if (minEffort === undefined) {
 			throw new Error(`Model ${model.provider}/${model.id} has no supported reasoning efforts`);
 		}
-		params.reasoning_effort = mapReasoningEffort(minEffort, compat.reasoningEffortMap) as Effort;
+		params.reasoning_effort = (compat.reasoningEffortMap?.[minEffort] ??
+			model.thinking?.effortMap?.[minEffort] ??
+			minEffort) as Effort;
 	}
 
 	if (compat.disableReasoningOnToolChoice && params.tool_choice !== undefined) {
@@ -1493,13 +1516,6 @@ export function parseChunkUsage(
 	};
 	calculateCost(model, usage);
 	return usage;
-}
-
-function mapReasoningEffort(
-	effort: NonNullable<OpenAICompletionsOptions["reasoning"]>,
-	reasoningEffortMap: Partial<Record<NonNullable<OpenAICompletionsOptions["reasoning"]>, string>>,
-): string {
-	return reasoningEffortMap[effort] ?? effort;
 }
 
 function maybeAddAnthropicCacheControl(compat: ResolvedOpenAICompat, messages: ChatCompletionMessageParam[]): void {
@@ -2066,6 +2082,13 @@ function mapStopReason(reason: ChatCompletionChunk.Choice["finish_reason"] | str
 			return { stopReason: "error", errorMessage: "Provider finish_reason: content_filter" };
 		case "network_error":
 			return { stopReason: "error", errorMessage: "Provider finish_reason: network_error" };
+		case "error":
+			// Gateways (OpenRouter, Vercel AI Gateway, …) report upstream model
+			// failures as a bare `finish_reason: "error"` with no detail. These are
+			// almost always transient (e.g. Gemini MALFORMED_FUNCTION_CALL), so word
+			// the message to match the session retry classifier's transient-transport
+			// pattern (`provider.?returned.?error`) and get the turn auto-retried.
+			return { stopReason: "error", errorMessage: "Provider returned error finish_reason" };
 		default:
 			return {
 				stopReason: "error",

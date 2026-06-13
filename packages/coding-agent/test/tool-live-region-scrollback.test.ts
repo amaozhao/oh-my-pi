@@ -387,8 +387,151 @@ describe("tool live-region scrollback", () => {
 				.map(row => Bun.stripANSI(row).trimEnd())
 				.join("\n");
 			expect(bufferText).not.toContain("pending [1/1]");
-			expect(bufferText).toContain("const line9 = 9;");
+			// The running cell renders the bounded TAIL window of the code: the
+			// live edge stays visible; the head is elided behind a marker.
 			expect(bufferText).toContain("const line19 = 19;");
+			expect(bufferText).toContain("earlier lines");
+			expect(bufferText).not.toContain("const line0 = 0;");
+		} finally {
+			component.stopAnimation();
+			tui.stop();
+			await term.flush();
+		}
+	});
+
+	it("does not strand a stale pending edit preview in scrollback when the result re-lays-out the block", async () => {
+		if (process.platform === "win32") return;
+
+		// Regression for the "tool call rendered inside itself" spray: an edit's
+		// pending preview is a TAIL window of the streamed diff ("… N more lines
+		// above" + last rows), and it goes byte-static once args complete — the
+		// spinner stops while the apply + LSP pass runs. The stable-prefix
+		// ratchet used to promote that settled head after
+		// STABLE_PREFIX_COMMIT_FRAMES and commit it to native scrollback; the
+		// result render then re-anchors the block top-first (stats header +
+		// head-anchored diff), the committed-prefix audit re-anchors at the
+		// divergence, and the stale call-box fragment stayed stranded above the
+		// final box. Pending collapsed previews are provisional and must never
+		// commit.
+		const term = new VirtualTerminal(120, 10);
+		const tui = new TUI(term);
+		const chat = new TranscriptContainer();
+		const diffLines: string[] = [];
+		for (let i = 0; i < 14; i++) {
+			diffLines.push(`-const before_${i} = ${i};`);
+			diffLines.push(`+const after_${i} = ${i};`);
+		}
+		const diff = diffLines.join("\n");
+		const args = { path: "src/sample.ts", op: "update", diff };
+		const component = new ToolExecutionComponent("edit", args, {}, undefined, tui, process.cwd());
+
+		try {
+			chat.addChild(new Text("prior filler\n".repeat(6).trimEnd(), 0, 0));
+			tui.addChild(chat);
+			tui.start();
+			await term.waitForRender();
+
+			chat.addChild(component);
+			component.setArgsComplete();
+			tui.requestRender();
+			await term.waitForRender();
+
+			// The tail-window preview's live edge is on screen while the tool
+			// executes (its head sits above the viewport and stays uncommitted).
+			const pending = term
+				.getScrollBuffer()
+				.map(row => Bun.stripANSI(row).trimEnd())
+				.join("\n");
+			expect(pending).toContain("(streaming)");
+
+			// The tool runs with a byte-static preview — far past the
+			// stable-prefix promotion window.
+			for (let frame = 0; frame < 40; frame++) {
+				tui.requestRender();
+				await term.waitForRender();
+			}
+
+			component.updateResult(
+				{
+					content: [{ type: "text", text: "" }],
+					details: { diff, path: "src/sample.ts", firstChangedLine: 1 },
+				},
+				false,
+			);
+			tui.requestRender();
+			await term.waitForRender();
+
+			const bufferText = term
+				.getScrollBuffer()
+				.map(row => Bun.stripANSI(row).trimEnd())
+				.join("\n");
+			// The tail-window marker exists only in the pending preview's head; any
+			// occurrence after the result means a committed fragment of the call
+			// box was stranded above the final block.
+			expect(bufferText).not.toContain("more lines above");
+			expect(bufferText).not.toContain("(streaming)");
+			// The result's head-anchored diff is present.
+			expect(bufferText).toContain("+const after_0 = 0;");
+		} finally {
+			component.stopAnimation();
+			tui.stop();
+			await term.flush();
+		}
+	});
+
+	it("scroll-appends a tall collapsed streaming task call into native scrollback mid-stream", async () => {
+		if (process.platform === "win32") return;
+
+		// Regression for the blanket commit-unstable gate: marking EVERY pending
+		// collapsed preview provisional meant a task call whose context markdown
+		// outgrew the viewport had its head neither on screen nor in scrollback
+		// until the result landed — the transcript read as cut off for the whole
+		// run. The task call preview streams top-anchored append-shaped rows the
+		// result render preserves, so it stays commit-eligible while collapsed.
+		const term = new VirtualTerminal(120, 12);
+		const tui = new TUI(term);
+		const chat = new TranscriptContainer();
+		const contextLines = Array.from({ length: 60 }, (_unused, i) => `ctx_line_${i} = ${i}`);
+		// Fenced code: each streamed line appends exactly one row, no re-wrap.
+		const buildContext = (count: number) => `\`\`\`\n${contextLines.slice(0, count).join("\n")}\n`;
+		const component = new ToolExecutionComponent(
+			"task",
+			{ agent: "task", context: buildContext(1) },
+			{},
+			undefined,
+			tui,
+			process.cwd(),
+		);
+
+		try {
+			chat.addChild(new Text("prior filler", 0, 0));
+			tui.addChild(chat);
+			tui.start();
+			await term.waitForRender();
+
+			chat.addChild(component);
+			tui.requestRender();
+			await term.waitForRender();
+
+			for (let count = 5; count <= contextLines.length; count += 5) {
+				component.updateArgs({ agent: "task", context: buildContext(count) });
+				tui.requestRender();
+				await term.waitForRender();
+			}
+
+			// Still streaming: no result, collapsed. The head of the context must
+			// already be in the buffer (committed above the window), not cut off —
+			// and the viewport itself only shows the streaming tail.
+			const rows = term.getScrollBuffer().map(row => Bun.stripANSI(row).trimEnd());
+			const bufferText = rows.join("\n");
+			expect(bufferText).toContain("ctx_line_0 = 0");
+			expect(bufferText).toContain("ctx_line_30 = 30");
+			expect(rows.length).toBeGreaterThan(term.rows);
+			const viewportText = term
+				.getViewport()
+				.map(row => Bun.stripANSI(row).trimEnd())
+				.join("\n");
+			expect(viewportText).not.toContain("ctx_line_0 = 0");
 		} finally {
 			component.stopAnimation();
 			tui.stop();
@@ -566,10 +709,11 @@ describe("tool live-region scrollback", () => {
 	it("commits the scrolled-off head of an over-tall pending eval cell to scrollback", async () => {
 		if (process.platform === "win32") return;
 
-		// The single-spawn task renderer bounds its pending preview (the old
-		// uncapped multi-task `context` field is gone), so the eval tool —
-		// whose pending code preview is intentionally never capped — now
-		// carries the over-tall pending content.
+		// Collapsed eval previews are head-capped (renderCodeCell's default
+		// window), so they can no longer go over-tall on their own. Expanded
+		// (ctrl+o) lifts the cap — the preview renders the whole brief
+		// top-anchored, append-only as chunks stream in — so the expanded eval
+		// cell carries the over-tall pending content here.
 		const term = new VirtualTerminal(120, 12);
 		const tui = new TUI(term);
 		const chat = new TranscriptContainer();
@@ -578,6 +722,7 @@ describe("tool live-region scrollback", () => {
 			cells: [{ language: "js", title: "probe", code: code(n) }],
 		});
 		const component = new ToolExecutionComponent("eval", args(4), {}, undefined, tui, process.cwd());
+		component.setExpanded(true);
 
 		try {
 			chat.addChild(component);
@@ -873,6 +1018,83 @@ describe("tool live-region scrollback", () => {
 			expect(scrollText).toContain("MARK-20");
 			// The streaming tail stays on screen, and nothing went missing between.
 			expect(viewportText).toContain("MARK-39");
+		} finally {
+			component.stopAnimation();
+			tui.stop();
+			await term.flush();
+		}
+	});
+
+	it("leaves a coherent window when a streaming write is interrupted mid-commit", async () => {
+		if (process.platform === "win32") return;
+
+		// Repro for the interrupt artifact: a streaming tool whose head rows have
+		// already committed to native scrollback is aborted (Esc). The block
+		// flips finalized and collapses to its aborted result in one step; the
+		// window below — including the editor box — must repaint coherently, with
+		// no stale frame fragments or mis-offset border rows left behind.
+		const term = new VirtualTerminal(80, 12);
+		const tui = new TUI(term);
+		const chat = new TranscriptContainer();
+		const fullContent = Array.from({ length: 60 }, (_unused, i) => `const streamed_line_${i} = ${i};`).join("\n");
+		const component = new ToolExecutionComponent(
+			"write",
+			{ file_path: "packages/coding-agent/test/probe.ts", content: "" },
+			{},
+			undefined,
+			tui,
+			process.cwd(),
+		);
+		component.setExpanded(true);
+		const editor = new Text("╭── status ──╮\n│ >          │\n╰────────────╯", 0, 0);
+
+		try {
+			chat.addChild(new Text("prior filler", 0, 0));
+			tui.addChild(chat);
+			tui.addChild(editor);
+			tui.start();
+			await term.waitForRender();
+
+			chat.addChild(component);
+			tui.requestRender();
+			await term.waitForRender();
+
+			// Stream until the preview head scrolls off and commits.
+			const chunk = Math.ceil(fullContent.length / 12);
+			for (let off = chunk; off < fullContent.length; off += chunk) {
+				component.updateArgs({
+					file_path: "packages/coding-agent/test/probe.ts",
+					content: fullContent.slice(0, off),
+				});
+				tui.requestRender();
+				await term.waitForRender();
+			}
+			expect(term.getScrollBuffer().length).toBeGreaterThan(term.rows);
+
+			// Interrupt: agent-loop synthesizes the aborted error result.
+			component.updateResult(
+				{ content: [{ type: "text", text: "Tool execution was aborted: Interrupted by user" }], isError: true },
+				false,
+			);
+			tui.requestRender();
+			await term.waitForRender();
+
+			// Oracle: the settled window must match what a forced full repaint
+			// produces — byte-identical rows. Stale fragments from the collapsed
+			// streaming frame (mis-offset editor borders, orphaned `│`/`╰` rows)
+			// diverge here.
+			const settled = term.getViewport().map(row => Bun.stripANSI(row).trimEnd());
+			tui.requestRender(true);
+			await term.waitForRender();
+			const repainted = term.getViewport().map(row => Bun.stripANSI(row).trimEnd());
+			expect(settled).toEqual(repainted);
+
+			// The aborted state and intact editor box are on screen.
+			const viewportText = settled.join("\n");
+			expect(viewportText).toContain("aborted");
+			expect(viewportText).toContain("╭── status ──╮");
+			expect(viewportText).toContain("╰────────────╯");
+			expect(settled.some(row => row.startsWith("╭── status"))).toBe(true);
 		} finally {
 			component.stopAnimation();
 			tui.stop();

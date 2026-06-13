@@ -6,7 +6,7 @@ import { formatHashlineHeader, stripHashlinePrefixes } from "@oh-my-pi/hashline"
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { isEnoent, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 
 import { canonicalSnapshotKey, getFileSnapshotStore } from "../edit/file-snapshot-store";
 import { normalizeToLF } from "../edit/normalize";
@@ -37,12 +37,15 @@ import { type OutputMeta, outputMeta } from "./output-meta";
 import { formatPathRelativeToCwd, isInternalUrlPath } from "./path-utils";
 import { enforcePlanModeWrite, resolvePlanPath } from "./plan-mode-guard";
 import {
+	cachedRenderedString,
+	createRenderedStringCache,
 	formatDiagnostics,
 	formatErrorDetail,
 	formatExpandHint,
 	formatMoreItems,
 	formatStatusIcon,
 	getLspBatchRequest,
+	type RenderedStringCache,
 	replaceTabs,
 	shortenPath,
 } from "./render-utils";
@@ -580,9 +583,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 	/**
 	 * Resolve a single `conflict://<N>` write by splicing the recorded
-	 * marker region in the registered file with `replacementContent`,
-	 * then routing the new file content through the normal writethrough
-	 * pipeline so LSP format/diagnostics still run.
+	 * marker region in the registered file with `replacementContent`.
+	 * The write deliberately bypasses the LSP writethrough: the file may
+	 * still hold other unresolved marker blocks, so formatting could
+	 * corrupt them and diagnostics would be marker-noise anyway.
 	 *
 	 * Entry ids are session-stable: they keep working even after later
 	 * writes resolve other blocks in the same file. The recorded range
@@ -594,7 +598,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		replacementContent: string,
 		stripped: boolean,
 		signal: AbortSignal | undefined,
-		context: AgentToolContext | undefined,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		const absolutePath = entry.absolutePath;
 		if (!(await fs.exists(absolutePath))) {
@@ -605,8 +608,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const originalText = await Bun.file(absolutePath).text();
 		const newContent = spliceConflict(originalText, entry, expanded);
 
-		const batchRequest = getLspBatchRequest(context?.toolCall);
-		const diagnostics = await this.#writethrough(absolutePath, newContent, signal, undefined, batchRequest);
+		await writethroughNoop(absolutePath, newContent, signal);
 		invalidateFsScanAfterWrite(absolutePath);
 		this.session.bumpFileMutationVersion?.(absolutePath);
 		this.session.fileSnapshotStore?.invalidate(absolutePath);
@@ -640,21 +642,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
 		}
 
-		if (!diagnostics) {
-			return {
-				content: [{ type: "text", text: resultText }],
-				details: { resolvedPath: absolutePath },
-			};
-		}
 		return {
 			content: [{ type: "text", text: resultText }],
-			details: {
-				resolvedPath: absolutePath,
-				diagnostics,
-				meta: outputMeta()
-					.diagnostics(diagnostics.summary, diagnostics.messages ?? [])
-					.get(),
-			},
+			details: { resolvedPath: absolutePath },
 		};
 	}
 
@@ -667,7 +657,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		replacementContent: string,
 		stripped: boolean,
 		signal: AbortSignal | undefined,
-		context: AgentToolContext | undefined,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		const entry = getConflictHistory(this.session).get(id);
 		if (!entry) {
@@ -675,7 +664,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				`Conflict #${id} not found. Conflict ids are registered when \`read\` surfaces a marker block; re-read the file to get a current id.`,
 			);
 		}
-		return this.#resolveConflict(entry, replacementContent, stripped, signal, context);
+		return this.#resolveConflict(entry, replacementContent, stripped, signal);
 	}
 
 	/**
@@ -697,7 +686,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		replacementContent: string,
 		stripped: boolean,
 		signal: AbortSignal | undefined,
-		context: AgentToolContext | undefined,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		const history = getConflictHistory(this.session);
 		const allEntries = history.entries();
@@ -714,8 +702,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			byFile.set(entry.absolutePath, bucket);
 		}
 
-		const batchRequest = getLspBatchRequest(context?.toolCall);
-		const allDiagnostics: FileDiagnosticsResult[] = [];
 		const succeededFiles: { displayPath: string; count: number; header?: string }[] = [];
 		const failedFiles: { displayPath: string; count: number; error: string }[] = [];
 		let totalResolvedIds = 0;
@@ -773,7 +759,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				continue;
 			}
 
-			const diagnostics = await this.#writethrough(absolutePath, text, signal, undefined, batchRequest);
+			await writethroughNoop(absolutePath, text, signal);
 			invalidateFsScanAfterWrite(absolutePath);
 			this.session.bumpFileMutationVersion?.(absolutePath);
 			this.session.fileSnapshotStore?.invalidate(absolutePath);
@@ -782,7 +768,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const header = maybeWriteSnapshotHeader(this.session, absolutePath, text);
 			succeededFiles.push({ displayPath: sample.displayPath, count: resolvedEntries.length, header });
 			totalResolvedIds += resolvedEntries.length;
-			if (diagnostics) allDiagnostics.push(diagnostics);
 		}
 
 		const summaryLines: string[] = [];
@@ -816,23 +801,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		}
 		const resultText = summaryLines.join("\n");
 
-		if (allDiagnostics.length === 0) {
-			if (failedFiles.length > 0 && succeededFiles.length === 0) {
-				throw new ToolError(resultText);
-			}
-			return {
-				content: [{ type: "text", text: resultText }],
-				details: {},
-				isError: failedFiles.length > 0 ? true : undefined,
-			};
+		if (failedFiles.length > 0 && succeededFiles.length === 0) {
+			throw new ToolError(resultText);
 		}
-		const mergedSummary = allDiagnostics.map(d => d.summary).join("\n");
-		const mergedMessages = allDiagnostics.flatMap(d => d.messages ?? []);
 		return {
 			content: [{ type: "text", text: resultText }],
-			details: {
-				meta: outputMeta().diagnostics(mergedSummary, mergedMessages).get(),
-			},
+			details: {},
 			isError: failedFiles.length > 0 ? true : undefined,
 		};
 	}
@@ -882,8 +856,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}
 				const result =
 					conflictUri.id === "*"
-						? await this.#resolveAllConflicts(cleanContent, stripped, signal, context)
-						: await this.#resolveSingleConflictById(conflictUri.id, cleanContent, stripped, signal, context);
+						? await this.#resolveAllConflicts(cleanContent, stripped, signal)
+						: await this.#resolveSingleConflictById(conflictUri.id, cleanContent, stripped, signal);
 				if (conflictUri.recoveredPrefix !== undefined) {
 					appendNoteToResult(
 						result,
@@ -1042,37 +1016,40 @@ function formatStreamingContent(
 	language: string | undefined,
 	uiTheme: Theme,
 	spinnerFrame?: number,
+	cache?: RenderedStringCache,
 ): string {
 	if (!content) return "";
-	const lines = normalizeDisplayText(content).split("\n");
-	const totalLines = lines.length;
-	// Collapsed: follow the streaming edge with a bounded tail window so the box
-	// stays short enough not to strand its scrolled-off head above the viewport
-	// while the block is volatile. `Ctrl+O` (expanded) lifts the cap for a
-	// deliberate full view — matching the eval streaming preview.
-	const startIndex = expanded ? 0 : Math.max(0, totalLines - WRITE_STREAMING_PREVIEW_LINES);
-	const visibleLines = lines.slice(startIndex);
-	const hidden = startIndex;
-	const highlighted = highlightCode(visibleLines.join("\n"), language);
-	const lineNumberWidth = Math.max(WRITE_GUTTER_MIN_WIDTH, String(totalLines).length);
+	const bodyText = cachedRenderedString(cache, uiTheme, expanded, language ?? "", content, () => {
+		const lines = normalizeDisplayText(content).split("\n");
+		const totalLines = lines.length;
+		// Collapsed: follow the streaming edge with a bounded tail window so the box
+		// stays short enough not to strand its scrolled-off head above the viewport
+		// while the block is volatile. `Ctrl+O` (expanded) lifts the cap for a
+		// deliberate full view — matching the eval streaming preview.
+		const startIndex = expanded ? 0 : Math.max(0, totalLines - WRITE_STREAMING_PREVIEW_LINES);
+		const visibleLines = lines.slice(startIndex);
+		const hidden = startIndex;
+		const highlighted = highlightCode(visibleLines.join("\n"), language);
+		const lineNumberWidth = Math.max(WRITE_GUTTER_MIN_WIDTH, String(totalLines).length);
 
-	let text = "\n\n";
-	if (hidden > 0) {
-		text += `${uiTheme.fg("dim", `… (${hidden} earlier line${hidden === 1 ? "" : "s"})`)}\n`;
-	}
-	for (let i = 0; i < highlighted.length; i++) {
-		const lineNum = startIndex + i + 1;
-		const gutter = uiTheme.fg("dim", `${String(lineNum).padStart(lineNumberWidth, " ")} `);
-		const body = replaceTabs(highlighted[i] ?? "");
-		text += `${gutter}${body}\n`;
-	}
+		let text = "\n\n";
+		if (hidden > 0) {
+			text += `${uiTheme.fg("dim", `… (${hidden} earlier line${hidden === 1 ? "" : "s"})`)}\n`;
+		}
+		for (let i = 0; i < highlighted.length; i++) {
+			const lineNum = startIndex + i + 1;
+			const gutter = uiTheme.fg("dim", `${String(lineNum).padStart(lineNumberWidth, " ")} `);
+			const body = replaceTabs(highlighted[i] ?? "");
+			text += `${gutter}${body}\n`;
+		}
+		return text;
+	});
 	// The animated glyph lives on this trailing line — inside the transcript's
 	// volatile-tail holdback — never in the header: an animating head row pins
 	// the native-scrollback commit boundary at the top of the block, so a long
 	// expanded preview could never scroll-append mid-stream.
 	const spinner = spinnerFrame !== undefined ? `${formatStatusIcon("running", uiTheme, spinnerFrame)} ` : "";
-	text += `${spinner}${uiTheme.fg("dim", `… (streaming)`)}`;
-	return text;
+	return `${bodyText}${spinner}${uiTheme.fg("dim", `… (streaming)`)}`;
 }
 
 function renderContentPreview(
@@ -1080,29 +1057,32 @@ function renderContentPreview(
 	expanded: boolean,
 	language: string | undefined,
 	uiTheme: Theme,
+	cache?: RenderedStringCache,
 ): string {
 	if (!content) return "";
-	const rawLines = normalizeDisplayText(content).split("\n");
-	const totalLines = rawLines.length;
-	const maxLines = expanded ? totalLines : Math.min(totalLines, WRITE_PREVIEW_LINES);
-	const visibleLines = rawLines.slice(0, maxLines);
-	const highlighted = highlightCode(visibleLines.join("\n"), language);
-	const lineNumberWidth = Math.max(WRITE_GUTTER_MIN_WIDTH, String(totalLines).length);
-	const hidden = totalLines - maxLines;
+	return cachedRenderedString(cache, uiTheme, expanded, language ?? "", content, () => {
+		const rawLines = normalizeDisplayText(content).split("\n");
+		const totalLines = rawLines.length;
+		const maxLines = expanded ? totalLines : Math.min(totalLines, WRITE_PREVIEW_LINES);
+		const visibleLines = rawLines.slice(0, maxLines);
+		const highlighted = highlightCode(visibleLines.join("\n"), language);
+		const lineNumberWidth = Math.max(WRITE_GUTTER_MIN_WIDTH, String(totalLines).length);
+		const hidden = totalLines - maxLines;
 
-	let text = "\n\n";
-	for (let i = 0; i < highlighted.length; i++) {
-		const lineNum = i + 1;
-		const gutter = uiTheme.fg("dim", `${String(lineNum).padStart(lineNumberWidth, " ")} `);
-		const body = replaceTabs(highlighted[i] ?? "");
-		text += `${gutter}${body}\n`;
-	}
-	if (!expanded && hidden > 0) {
-		const hint = formatExpandHint(uiTheme, expanded, hidden > 0);
-		const moreLine = `${formatMoreItems(hidden, "line")}${hint ? ` ${hint}` : ""}`;
-		text += uiTheme.fg("dim", moreLine);
-	}
-	return text.trimEnd();
+		let text = "\n\n";
+		for (let i = 0; i < highlighted.length; i++) {
+			const lineNum = i + 1;
+			const gutter = uiTheme.fg("dim", `${String(lineNum).padStart(lineNumberWidth, " ")} `);
+			const body = replaceTabs(highlighted[i] ?? "");
+			text += `${gutter}${body}\n`;
+		}
+		if (!expanded && hidden > 0) {
+			const hint = formatExpandHint(uiTheme, expanded, hidden > 0);
+			const moreLine = `${formatMoreItems(hidden, "line")}${hint ? ` ${hint}` : ""}`;
+			text += uiTheme.fg("dim", moreLine);
+		}
+		return text.trimEnd();
+	});
 }
 
 export const writeToolRenderer = {
@@ -1125,9 +1105,17 @@ export const writeToolRenderer = {
 			},
 			uiTheme,
 		);
+		const streamingCache = createRenderedStringCache();
 		return framedBlock(uiTheme, width => {
 			const body = args.content
-				? formatStreamingContent(args.content, Boolean(options?.expanded), lang, uiTheme, options?.spinnerFrame)
+				? formatStreamingContent(
+						args.content,
+						Boolean(options?.expanded),
+						lang,
+						uiTheme,
+						options?.spinnerFrame,
+						streamingCache,
+					)
 				: "";
 			const bodyLines = body ? body.split("\n") : [];
 			while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
@@ -1189,9 +1177,10 @@ export const writeToolRenderer = {
 		);
 		const diagnostics = result.details?.diagnostics;
 
+		const previewCache = createRenderedStringCache();
 		return framedBlock(uiTheme, width => {
 			const { expanded } = options;
-			let body = renderContentPreview(fileContent, expanded, lang, uiTheme);
+			let body = renderContentPreview(fileContent, expanded, lang, uiTheme, previewCache);
 			if (diagnostics) {
 				const diagText = formatDiagnostics(diagnostics, expanded, uiTheme, fp =>
 					uiTheme.getLangIcon(getLanguageFromPath(fp)),

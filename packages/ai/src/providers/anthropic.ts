@@ -677,7 +677,18 @@ function generateClaudeJsonUserId(sessionId?: string, accountId?: string): strin
 	return JSON.stringify(userId);
 }
 
-function resolveAnthropicMetadataUserId(
+/**
+ * Resolve the `metadata.user_id` field for an Anthropic Messages request.
+ *
+ * For API-key tokens, an explicit caller-supplied `userId` is forwarded
+ * verbatim and `undefined` yields no metadata. For OAuth tokens the value
+ * must match the Claude Code attribution shape (`isClaudeCloakingUserId` or
+ * the `{session_id, account_uuid?, device_id?}` JSON envelope) — anything
+ * else is dropped and a fresh Claude-Code-style JSON id is generated from
+ * `sessionId`/`accountId` so attribution stays consistent across the main
+ * streaming path and provider-specific request builders (e.g. web search).
+ */
+export function resolveAnthropicMetadataUserId(
 	userId: unknown,
 	isOAuthToken: boolean,
 	sessionId?: string,
@@ -862,13 +873,7 @@ async function prepareAnthropicManyImageContext(context: Context, supportsImages
 	return { ...context, messages };
 }
 
-/**
- * Convert content blocks to Anthropic API format
- */
-function convertContentBlocks(
-	content: (TextContent | ImageContent)[],
-	supportsImages = true,
-):
+type AnthropicToolResultContent =
 	| string
 	| Array<
 			| { type: "text"; text: string }
@@ -880,7 +885,15 @@ function convertContentBlocks(
 						data: string;
 					};
 			  }
-	  > {
+	  >;
+
+/**
+ * Convert content blocks to Anthropic API format
+ */
+function convertContentBlocks(
+	content: (TextContent | ImageContent)[],
+	supportsImages = true,
+): AnthropicToolResultContent {
 	const blocks: Array<
 		| { type: "text"; text: string }
 		| {
@@ -960,6 +973,11 @@ export interface AnthropicOptions extends StreamOptions {
 	 * Ignored for adaptive-capable models.
 	 */
 	thinkingBudgetTokens?: number;
+	/**
+	 * Upstream wire model id override for collapsed effort-tier variants.
+	 * Serialized as `requestModelId ?? model.requestModelId ?? model.id`.
+	 */
+	requestModelId?: string;
 	/**
 	 * Effort level for adaptive thinking.
 	 * Controls how much thinking Claude allocates:
@@ -1621,6 +1639,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				if (replacementPayload !== undefined) {
 					nextParams = replacementPayload as typeof nextParams;
 				}
+				nextParams = toWellFormedDeep(nextParams) as typeof nextParams;
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
@@ -1992,6 +2011,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							}
 							if (output.stopReason === "error") {
 								const stopDetails = delta?.stop_details;
+								output.stopDetails = stopDetails ?? (rawStopReason ? { type: rawStopReason } : null);
 								if (stopDetails?.type === "refusal") {
 									const explanation = stopDetails.explanation?.trim();
 									const category = stopDetails.category;
@@ -2151,6 +2171,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					output.content.length = 0;
 					output.responseId = undefined;
 					output.errorMessage = undefined;
+					output.stopDetails = undefined;
 					output.providerPayload = undefined;
 					output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
 					output.stopReason = "stop";
@@ -2801,7 +2822,7 @@ function buildParams(
 	// Build params in the canonical field order: model → messages → system → tools →
 	// metadata → max_tokens → thinking → context_management → output_config → stream.
 	const params: MessageCreateParamsStreaming = {
-		model: model.id,
+		model: options?.requestModelId ?? model.requestModelId ?? model.id,
 		messages: convertAnthropicMessages(context.messages, model, isOAuthToken),
 		...(systemBlocks && { system: systemBlocks }),
 		...(tools !== undefined && { tools }),
@@ -2870,11 +2891,47 @@ function buildParams(
 	return params;
 }
 
-function buildToolResultBlock(model: Model<"anthropic-messages">, msg: ToolResultMessage): ContentBlockParam {
+const EMPTY_ERROR_TOOL_RESULT_TEXT = "Tool failed with no output.";
+
+function isEmptyToolResultWireContent(content: AnthropicToolResultContent): boolean {
+	if (typeof content === "string") {
+		return content.trim().length === 0;
+	}
+	return content.length === 0;
+}
+
+function ensureErrorToolResultWireContent(
+	content: AnthropicToolResultContent,
+	isError: boolean | undefined,
+): AnthropicToolResultContent {
+	if (!isError || !isEmptyToolResultWireContent(content)) {
+		return content;
+	}
+	return typeof content === "string"
+		? EMPTY_ERROR_TOOL_RESULT_TEXT
+		: [{ type: "text", text: EMPTY_ERROR_TOOL_RESULT_TEXT }];
+}
+
+function buildToolResultBlock(
+	model: Model<"anthropic-messages">,
+	msg: ToolResultMessage,
+	hoistedImages: ContentBlockParam[],
+): ContentBlockParam {
+	let content = convertContentBlocks(msg.content, model.input.includes("image"));
+	// Anthropic rejects images inside error tool results ("all content must be
+	// type `text` if `is_error` is true") — keep the text in the block and
+	// hoist the images after the message's tool_result run.
+	if (msg.isError && typeof content !== "string" && content.some(block => block.type === "image")) {
+		for (const block of content) {
+			if (block.type === "image") hoistedImages.push(block);
+		}
+		content = content.filter(block => block.type === "text");
+	}
+	content = ensureErrorToolResultWireContent(content, msg.isError);
 	const block: ContentBlockParam = {
 		type: "tool_result",
 		tool_use_id: msg.toolCallId,
-		content: convertContentBlocks(msg.content, model.input.includes("image")),
+		content,
 		is_error: msg.isError,
 	};
 	if (model.compat.requiresToolResultId) {
@@ -3019,13 +3076,12 @@ export function convertAnthropicMessages(
 						type: "tool_use",
 						id: block.id,
 						name: isOAuthToken ? applyClaudeToolPrefix(block.name) : block.name,
-						// Anthropic-origin arguments are guaranteed well-formed (they came
-						// from the API's own JSON); cross-API replays can carry lone
-						// surrogates that Anthropic's strict UTF-8 validation rejects.
-						input:
-							msg.api === "anthropic-messages"
-								? (block.arguments ?? {})
-								: toWellFormedDeep(block.arguments ?? {}),
+						// Always sanitize: the model itself can emit lone-surrogate escapes
+						// in tool-argument JSON (streamed out fine, rejected with a 400 on
+						// replay by Anthropic's strict UTF-8 validation). toWellFormedDeep
+						// is identity-preserving, so well-formed arguments stay
+						// byte-identical and prompt-cache prefixes are unaffected.
+						input: toWellFormedDeep(block.arguments ?? {}),
 					});
 				}
 			}
@@ -3037,20 +3093,29 @@ export function convertAnthropicMessages(
 		} else if (msg.role === "toolResult") {
 			// Collect all consecutive toolResult messages, needed for z.ai Anthropic endpoint
 			const toolResults: ContentBlockParam[] = [];
+			// Images stripped out of error tool results, re-attached after the run.
+			const hoistedImages: ContentBlockParam[] = [];
 
 			// Add the current tool result
-			toolResults.push(buildToolResultBlock(model, msg));
+			toolResults.push(buildToolResultBlock(model, msg, hoistedImages));
 
 			// Look ahead for consecutive toolResult messages
 			let j = i + 1;
 			while (j < transformedMessages.length && transformedMessages[j].role === "toolResult") {
 				const nextMsg = transformedMessages[j] as ToolResultMessage; // We know it's a toolResult
-				toolResults.push(buildToolResultBlock(model, nextMsg));
+				toolResults.push(buildToolResultBlock(model, nextMsg, hoistedImages));
 				j++;
 			}
 
 			// Skip the messages we've already processed
 			i = j - 1;
+
+			if (hoistedImages.length > 0) {
+				toolResults.push(
+					{ type: "text", text: "Attached image(s) from the tool result(s) above:" },
+					...hoistedImages,
+				);
+			}
 
 			// Add a single user message with all tool results
 			params.push({

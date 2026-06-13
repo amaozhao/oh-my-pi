@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { type Component, type NativeScrollbackLiveRegion, TUI } from "@oh-my-pi/pi-tui";
+import {
+	type Component,
+	type NativeScrollbackCommittedRows,
+	type NativeScrollbackLiveRegion,
+	TUI,
+} from "@oh-my-pi/pi-tui";
 import { VirtualTerminal } from "./virtual-terminal";
 
 class LineList implements Component {
@@ -35,6 +40,26 @@ class LiveLineList extends LineList implements NativeScrollbackLiveRegion {
 class AppendOnlyLiveLineList extends LiveLineList {
 	getNativeScrollbackCommitSafeEnd(): number | undefined {
 		return Number.POSITIVE_INFINITY;
+	}
+}
+
+/**
+ * Records the engine's committed-row claim visible at each render() call.
+ * Pins the propagation contract: the claim must be fed *before* render so the
+ * child (e.g. the transcript container) can skip re-deriving blocks that
+ * already live in immutable native scrollback.
+ */
+class CommittedRowsProbe extends AppendOnlyLiveLineList implements NativeScrollbackCommittedRows {
+	#committedRows = 0;
+	committedRowsAtRender: number[] = [];
+
+	setNativeScrollbackCommittedRows(rows: number): void {
+		this.#committedRows = rows;
+	}
+
+	override render(width: number): string[] {
+		this.committedRowsAtRender.push(this.#committedRows);
+		return super.render(width);
 	}
 }
 
@@ -187,6 +212,46 @@ describe("streaming scrollback defer", () => {
 		try {
 			tui.addChild(sealed);
 			tui.addChild(live);
+			tui.start();
+			await settle(term);
+
+			const writes = capture(term);
+
+			live.setLines(rows("pending-stale-", 10));
+			tui.requestRender();
+			await settle(term);
+
+			live.setLines(rows("running-fresh-", 10));
+			tui.requestRender();
+			await settle(term);
+
+			const buffer = term.getScrollBuffer().map(line => line.trimEnd());
+			expect(eraseScrollbackCount(writes)).toBe(0);
+			expect(buffer.some(line => line.startsWith("pending-stale-"))).toBe(false);
+			expect(buffer).toContain("running-fresh-9");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps the topmost live seam when a lower sibling also reports one", async () => {
+		if (process.platform === "win32") return;
+		const term = new VirtualTerminal(24, 4);
+		overrideProbe(term, undefined);
+		const tui = new TUI(term);
+		const sealed = new LineList(rows("prior-", 12));
+		// Volatile live transcript block: seam at 0, no commit-safe end.
+		const live = new LiveLineList([]);
+		// Status loader below the transcript: also reports a seam. Commits are
+		// prefix-only, so the engine must keep the TOPMOST seam — letting the
+		// lower sibling's seam win would move the boundary past the transcript's
+		// still-mutable rows and commit them as stale history.
+		const loader = new LiveLineList(["Working..."]);
+
+		try {
+			tui.addChild(sealed);
+			tui.addChild(live);
+			tui.addChild(loader);
 			tui.start();
 			await settle(term);
 
@@ -407,6 +472,36 @@ describe("streaming scrollback defer", () => {
 					.map(line => line.trim())
 					.at(-1),
 			).toBe("prompt");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("feeds committed native scrollback rows to interested children before render", async () => {
+		if (process.platform === "win32") return;
+		const term = new VirtualTerminal(20, 4);
+		overrideProbe(term, undefined);
+		const tui = new TUI(term);
+		const probe = new CommittedRowsProbe([]);
+
+		try {
+			tui.addChild(probe);
+			tui.start();
+			await settle(term);
+
+			// Grow well past the 4-row viewport: the append-only body lets the
+			// engine commit the scrolled-off head to native scrollback.
+			probe.setLines(rows("out-", 12));
+			tui.requestRender();
+			await settle(term);
+
+			// The next compose must surface the engine's committed claim to the
+			// child before render(). A severed wire here silently disables the
+			// transcript's committed-block bypass (rows stay 0 forever).
+			tui.requestRender();
+			await settle(term);
+
+			expect(probe.committedRowsAtRender.at(-1)!).toBeGreaterThan(0);
 		} finally {
 			tui.stop();
 		}

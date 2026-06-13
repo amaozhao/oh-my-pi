@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import { type Component, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
-import { formatCount, getProjectDir } from "@oh-my-pi/pi-utils";
+import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import { settings } from "../../../config/settings";
 import type { AgentSession } from "../../../session/agent-session";
@@ -18,6 +18,7 @@ import { renderSegment, type SegmentContext } from "./segments";
 import { getSeparator } from "./separators";
 import { calculateTokensPerSecond } from "./token-rate";
 import type {
+	CollabStatus,
 	EffectiveStatusLineSettings,
 	StatusLineSegmentId,
 	StatusLineSegmentOptions,
@@ -152,6 +153,8 @@ export class StatusLineComponent implements Component {
 	#planModeStatus: { enabled: boolean; paused: boolean } | null = null;
 	#loopModeStatus: { enabled: boolean } | null = null;
 	#goalModeStatus: { enabled: boolean; paused: boolean } | null = null;
+	#collabStatus: CollabStatus | null = null;
+	#focusedAgentId: string | undefined;
 
 	// Git status caching (1s TTL)
 	#cachedGitStatus: { staged: number; unstaged: number; untracked: number } | null = null;
@@ -187,7 +190,7 @@ export class StatusLineComponent implements Component {
 	#nonMessageInputsKey: string | undefined;
 	#messageTokenTotalsCache: MessageTokenTotalsCache | undefined;
 
-	constructor(private readonly session: AgentSession) {
+	constructor(private session: AgentSession) {
 		this.#settings = {
 			preset: settings.get("statusLine.preset"),
 			leftSegments: settings.get("statusLine.leftSegments"),
@@ -196,7 +199,21 @@ export class StatusLineComponent implements Component {
 			showHookStatus: settings.get("statusLine.showHookStatus"),
 			segmentOptions: settings.getGroup("statusLine").segmentOptions,
 			sessionAccent: settings.get("statusLine.sessionAccent"),
+			transparent: settings.get("statusLine.transparent"),
 		};
+	}
+
+	/**
+	 * Re-point the status line at another session (focus proxy). Invalidate: model/context/usage all derive
+	 * from it. `focusedAgentId` is the focused subagent id while the view is proxied, undefined for main.
+	 */
+	setSession(session: AgentSession, focusedAgentId?: string): void {
+		const sessionChanged = this.session !== session;
+		if (!sessionChanged && this.#focusedAgentId === focusedAgentId) return;
+		this.session = session;
+		this.#focusedAgentId = focusedAgentId;
+		if (sessionChanged) this.#invalidateSessionCaches();
+		this.invalidate();
 	}
 
 	updateSettings(settings: StatusLineSettings): void {
@@ -216,6 +233,11 @@ export class StatusLineComponent implements Component {
 		this.#subagentCount = count;
 	}
 
+	/** Active subagent count as currently displayed (collab state mirroring). */
+	get subagentCount(): number {
+		return this.#subagentCount;
+	}
+
 	setSessionStartTime(time: number): void {
 		this.#sessionStartTime = time;
 	}
@@ -230,6 +252,10 @@ export class StatusLineComponent implements Component {
 
 	setGoalModeStatus(status: { enabled: boolean; paused: boolean } | undefined): void {
 		this.#goalModeStatus = status ?? null;
+	}
+
+	setCollabStatus(status: CollabStatus | null): void {
+		this.#collabStatus = status;
 	}
 
 	setHookStatus(key: string, text: string | undefined): void {
@@ -279,6 +305,16 @@ export class StatusLineComponent implements Component {
 
 	invalidate(): void {
 		this.#invalidateGitCaches();
+	}
+	#invalidateSessionCaches(): void {
+		this.#cachedUsage = null;
+		this.#usageFetchedAt = 0;
+		this.#usageInFlight = false;
+		this.#nonMessageTokensCache = undefined;
+		this.#nonMessageInputsKey = undefined;
+		this.#messageTokenTotalsCache = undefined;
+		this.#lastTokensPerSecond = null;
+		this.#lastTokensPerSecondTimestamp = null;
 	}
 
 	#invalidateGitCaches(): void {
@@ -440,16 +476,19 @@ export class StatusLineComponent implements Component {
 		const now = Date.now();
 		if (this.#usageInFlight) return;
 		if (this.#usageFetchedAt > 0 && now - this.#usageFetchedAt < 5 * 60_000) return;
-		const fetcher = (this.session as { fetchUsageReports?: () => Promise<unknown> }).fetchUsageReports;
+		const session = this.session;
+		const fetcher = (session as { fetchUsageReports?: () => Promise<unknown> }).fetchUsageReports;
 		if (typeof fetcher !== "function") return;
 		this.#usageInFlight = true;
 		void fetcher
-			.call(this.session)
+			.call(session)
 			.then(reports => {
+				if (this.session !== session) return;
 				this.#cachedUsage = this.#normalizeUsageReports(reports);
 				this.#usageFetchedAt = Date.now();
 			})
 			.catch(() => {
+				if (this.session !== session) return;
 				// Backoff on error: stamp the fetch time so the 5-min TTL guard
 				// also acts as an error budget. Without this, every render
 				// kicks off another fetch (gated only by #usageInFlight),
@@ -457,7 +496,7 @@ export class StatusLineComponent implements Component {
 				this.#usageFetchedAt = Date.now();
 			})
 			.finally(() => {
-				this.#usageInFlight = false;
+				if (this.session === session) this.#usageInFlight = false;
 			});
 	}
 
@@ -641,15 +680,25 @@ export class StatusLineComponent implements Component {
 			contextTokens = breakdown.usedTokens;
 			contextWindow = breakdown.contextWindow || contextWindow;
 		}
-		const contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
+		let contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
+
+		// Collab guest: context comes from the host's state frames — the local
+		// replica does no accounting of its own.
+		const collabState = this.#collabStatus?.stateOverride;
+		if (collabState?.contextUsage) {
+			contextWindow = collabState.contextUsage.contextWindow || contextWindow;
+			contextPercent = collabState.contextUsage.percent ?? contextPercent;
+		}
 
 		return {
 			session: this.session,
+			focusedAgentId: this.#focusedAgentId,
 			width,
 			options: segmentOptions ?? {},
 			planMode: this.#planModeStatus,
 			loopMode: this.#loopModeStatus,
 			goalMode: this.#goalModeStatus,
+			collab: this.#collabStatus,
 			usageStats,
 			contextPercent,
 			contextWindow,
@@ -713,7 +762,15 @@ export class StatusLineComponent implements Component {
 		const ctx = this.#buildSegmentContext(width, effectiveSettings.segmentOptions, includeContext);
 		const separatorDef = getSeparator(effectiveSettings.separator ?? "powerline-thin", theme);
 
-		const bgAnsi = theme.getBgAnsi("statusLineBg");
+		// `transparent` reuses the empty-string sentinel (`\x1b[49m`) so the bar
+		// inherits the terminal's default background, matching custom themes that
+		// set `statusLineBg: ""`. Powerline end caps need a contrasting fill to
+		// bridge the bar into the surrounding terminal; without one they read as
+		// stray glyphs, so the cap renderer drops them when the fill is empty.
+		const TRANSPARENT_BG_ANSI = "\x1b[49m";
+		const themeBgAnsi = theme.getBgAnsi("statusLineBg");
+		const bgAnsi = effectiveSettings.transparent ? TRANSPARENT_BG_ANSI : themeBgAnsi;
+		const transparentBg = bgAnsi === TRANSPARENT_BG_ANSI;
 		const fgAnsi = theme.getFgAnsi("text");
 		const sepAnsi = theme.getFgAnsi("statusLineSep");
 
@@ -738,9 +795,7 @@ export class StatusLineComponent implements Component {
 
 		const runningBackgroundJobs = this.session.getAsyncJobSnapshot()?.running.length ?? 0;
 		if (runningBackgroundJobs > 0) {
-			const icon = theme.icon.agents ? `${theme.icon.agents} ` : "";
-			const label = `${formatCount("job", runningBackgroundJobs)} running`;
-			rightParts.push(theme.fg("statusLineSubagents", `${icon}${label}`));
+			rightParts.unshift(theme.fg("statusLineSubagents", `${theme.icon.job} ${runningBackgroundJobs}`));
 		}
 		const topFillWidth = Math.max(0, width);
 		const left = [...leftParts];
@@ -748,8 +803,10 @@ export class StatusLineComponent implements Component {
 
 		const leftSepWidth = visibleWidth(separatorDef.left);
 		const rightSepWidth = visibleWidth(separatorDef.right);
-		const leftCapWidth = separatorDef.endCaps ? visibleWidth(separatorDef.endCaps.right) : 0;
-		const rightCapWidth = separatorDef.endCaps ? visibleWidth(separatorDef.endCaps.left) : 0;
+		// Transparent mode drops powerline caps (they need a bg fill to bridge),
+		// so the width budget excludes them too.
+		const leftCapWidth = separatorDef.endCaps && !transparentBg ? visibleWidth(separatorDef.endCaps.right) : 0;
+		const rightCapWidth = separatorDef.endCaps && !transparentBg ? visibleWidth(separatorDef.endCaps.left) : 0;
 
 		const groupWidth = (parts: string[], capWidth: number, sepWidth: number): number => {
 			if (parts.length === 0) return 0;
@@ -810,11 +867,12 @@ export class StatusLineComponent implements Component {
 		const renderGroup = (parts: string[], direction: "left" | "right"): string => {
 			if (parts.length === 0) return "";
 			const sep = direction === "left" ? separatorDef.left : separatorDef.right;
-			const cap = separatorDef.endCaps
-				? direction === "left"
-					? separatorDef.endCaps.right
-					: separatorDef.endCaps.left
-				: "";
+			const cap =
+				separatorDef.endCaps && !transparentBg
+					? direction === "left"
+						? separatorDef.endCaps.right
+						: separatorDef.endCaps.left
+					: "";
 			const capPrefix = separatorDef.endCaps?.useBgAsFg ? bgAnsi.replace("\x1b[48;", "\x1b[38;") : bgAnsi + sepAnsi;
 			const capText = cap ? `${capPrefix}${cap}\x1b[0m` : "";
 
@@ -839,14 +897,21 @@ export class StatusLineComponent implements Component {
 		const gapWidth = Math.max(1, topFillWidth - leftWidth - rightWidth);
 		const sessionName =
 			effectiveSettings.sessionAccent !== false ? this.session.sessionManager?.getSessionName() : undefined;
-		const accentHex = sessionName ? getSessionAccentHex(sessionName, theme.accentSurfaceLuminance) : undefined;
+		const accentHex = sessionName
+			? getSessionAccentHex(sessionName, theme.getMajorThemeColorHexes(), theme.accentSurfaceLuminance)
+			: undefined;
 		const gapColor = getSessionAccentAnsi(accentHex) ?? theme.getFgAnsi("border");
 		const gapFill = `${gapColor}${theme.boxRound.horizontal.repeat(gapWidth)}\x1b[39m`;
 		return leftGroup + gapFill + rightGroup;
 	}
 
 	getTopBorder(width: number): { content: string; width: number } {
-		const content = this.#buildStatusLine(width);
+		let content = this.#buildStatusLine(width);
+		if (this.#focusedAgentId && content) {
+			// Dim the whole bar while focus-proxied. Group/cap terminators emit full
+			// `\x1b[0m` resets that would cancel faint mid-bar, so re-open it after each.
+			content = `\x1b[2m${content.replaceAll("\x1b[0m", "\x1b[0m\x1b[2m")}\x1b[22m`;
+		}
 		return {
 			content,
 			width: visibleWidth(content),

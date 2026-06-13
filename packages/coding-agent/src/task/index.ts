@@ -9,7 +9,7 @@
  * Supports:
  *   - Single agent spawn per call (parallelism = parallel task calls)
  *   - Batch spawning + shared context per call when `task.batch` is enabled
- *   - Non-blocking execution via the session's AsyncJobManager
+ *   - Background execution through AsyncJobManager when `async.enabled` is enabled
  *   - Progress tracking via JSON events
  *   - Session artifacts for debugging
  */
@@ -190,6 +190,7 @@ function renderDescription(
 	isolationEnabled: boolean,
 	disabledAgents: string[],
 	batchEnabled: boolean,
+	asyncEnabled: boolean,
 	ircEnabled: boolean,
 	parentSpawns: string,
 ): string {
@@ -217,6 +218,7 @@ function renderDescription(
 		MAX_CONCURRENCY: maxConcurrency,
 		isolationEnabled,
 		batchEnabled,
+		asyncEnabled,
 		ircEnabled,
 	});
 }
@@ -374,8 +376,8 @@ function discoverAgentsForCreate(cwd: string): Promise<DiscoveryResult> {
  * Task tool - Delegate tasks to specialized agents.
  *
  * Each call spawns one subagent — or, with `task.batch`, one per `tasks[]`
- * item. Spawning is non-blocking: the call registers AsyncJobManager jobs and
- * returns immediately; each result is delivered when that agent yields.
+ * item. When `async.enabled` is on, spawns run as AsyncJobManager jobs; when
+ * disabled, the tool blocks until every spawn finishes.
  */
 export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetails, Theme> {
 	readonly name = "task";
@@ -411,7 +413,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return lines;
 	};
 	readonly label = "Task";
-	readonly summary = "Spawn a subagent to complete a task in the background";
+	readonly summary = "Spawn subagents to complete delegated tasks";
 	readonly strict = true;
 	readonly loadMode = "discoverable";
 	readonly renderResult = renderResult;
@@ -448,6 +450,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			isolationMode !== "none",
 			disabledAgents,
 			this.#isBatchEnabled(),
+			this.session.settings.get("async.enabled"),
 			isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			this.session.getSessionSpawns() ?? "*",
 		);
@@ -492,12 +495,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		const spawnItems = resolveSpawnItems(params);
 		const selectedAgent = this.#discoveredAgents.find(agent => agent.name === params.agent);
-		const manager = this.session.asyncJobManager;
-		if (!manager || selectedAgent?.blocking === true) {
-			// Sync fallback: orphaned host that never wired a job manager, or an
-			// agent definition that declares `blocking: true`. The session-scoped
-			// semaphore still bounds fan-out across parallel task calls.
-			if (!manager) {
+		const asyncEnabled = this.session.settings.get("async.enabled");
+		const manager = asyncEnabled ? this.session.asyncJobManager : undefined;
+		if (!asyncEnabled || !manager || selectedAgent?.blocking === true) {
+			// Sync fallback: async execution disabled, orphaned host that never
+			// wired a job manager, or an agent definition that declares
+			// `blocking: true`. The session-scoped semaphore still bounds fan-out
+			// across parallel task calls.
+			if (asyncEnabled && !manager) {
 				logger.warn("task: no AsyncJobManager registered; falling back to sync execution");
 			}
 			return this.#executeSyncFanout(toolCallId, params, spawnItems, signal, onUpdate);
@@ -693,7 +698,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					buildDetails("running", ownJobId) as unknown as Record<string, unknown>,
 				);
 				try {
-					const result = await this.#executeSync(toolCallId, spawnParams, runSignal, undefined, agentId);
+					const result = await this.#executeSync(
+						toolCallId,
+						spawnParams,
+						runSignal,
+						undefined,
+						agentId,
+						progress.index,
+						true,
+					);
 					const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 					const singleResult = result.details?.results[0];
 					// A missing result means the sync path failed at the tool level
@@ -776,7 +789,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (spawnItems.length === 1) {
 			await semaphore.acquire();
 			try {
-				return await this.#executeSync(toolCallId, spawnParamsFor(params, spawnItems[0]), signal, onUpdate);
+				return await this.#executeSync(
+					toolCallId,
+					spawnParamsFor(params, spawnItems[0]),
+					signal,
+					onUpdate,
+					undefined,
+					0,
+				);
 			} finally {
 				semaphore.release();
 			}
@@ -813,7 +833,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								}
 							}
 						: undefined;
-					return await this.#executeSync(toolCallId, spawnParamsFor(params, item), workerSignal, itemOnUpdate);
+					return await this.#executeSync(
+						toolCallId,
+						spawnParamsFor(params, item),
+						workerSignal,
+						itemOnUpdate,
+						undefined,
+						index,
+					);
 				} finally {
 					semaphore.release();
 				}
@@ -870,8 +897,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 		preAllocatedId?: string,
+		spawnIndex = 0,
+		detached = false,
 	): Promise<AgentToolResult<TaskToolDetails>> {
-		return this.#runSpawn(toolCallId, params, signal, onUpdate, preAllocatedId);
+		return this.#runSpawn(toolCallId, params, signal, onUpdate, preAllocatedId, spawnIndex, detached);
 	}
 
 	/** Spawn a fresh subagent and run it to completion. */
@@ -881,6 +910,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 		preAllocatedId?: string,
+		spawnIndex = 0,
+		detached = false,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		const { agents, projectAgentsDir } = await discoverAgents(this.session.cwd);
@@ -1065,7 +1096,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 			// Progress tracking for the single agent
 			let latestProgress: AgentProgress = {
-				index: 0,
+				index: spawnIndex,
 				id: agentId,
 				agent: agentName,
 				agentSource: agent.source,
@@ -1115,8 +1146,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				context: sharedContext,
 				planReference,
 				description: params.description,
-				index: 0,
+				index: spawnIndex,
 				parentToolCallId: toolCallId,
+				detached,
 				id: agentId,
 				taskDepth,
 				modelOverride,
@@ -1221,7 +1253,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					return {
-						index: 0,
+						index: spawnIndex,
 						id: agentId,
 						agent: agent.name,
 						agentSource: agent.source,
